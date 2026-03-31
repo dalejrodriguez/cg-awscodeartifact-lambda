@@ -1,0 +1,6 @@
+{
+  "comment": "Example 1: Load lockfile from S3, skip setup",
+  "s3_bucket": "my-lockfile-bucket",
+  "s3_key": "project/package-lock.json",
+  "setup_codeartifact": false
+}

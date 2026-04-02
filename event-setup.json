@@ -1,6 +1,0 @@
-{
-  "comment": "Example 2: Run CodeArtifact setup first, then sync from S3",
-  "s3_bucket": "my-lockfile-bucket",
-  "s3_key": "project/package-lock.json",
-  "setup_codeartifact": true
-}

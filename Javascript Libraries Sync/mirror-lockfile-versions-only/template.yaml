@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Sync Chainguard NPM packages to AWS CodeArtifact.
+  Reads a package-lock.json (from S3 or inline), fetches tarballs from
+  Chainguard Libraries, and publishes them to CodeArtifact.
+
+Parameters:
+  CgrUsername:
+    Type: String
+    Description: Chainguard registry username
+  CgrToken:
+    Type: String
+    Description: Chainguard registry token
+    NoEcho: true
+  CodeArtifactDomain:
+    Type: String
+    Default: my-npm-domain
+  CodeArtifactRepo:
+    Type: String
+    Default: my-npm-repo
+  CodeArtifactUpstream:
+    Type: String
+    Default: npm-public
+  MaxInvocations:
+    Type: Number
+    Description: Safety cap on self-re-invocations
+    Default: 50
+  MaxPackages:
+    Type: Number
+    Description: Maximum number of packages to process per run
+    Default: 50000
+
+Resources:
+  # ------------------------------------------------------------------
+  # S3 bucket for errors, checkpoints, and lockfile uploads
+  # ------------------------------------------------------------------
+  SyncBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-chainguard-sync-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          # Lockfile-sync checkpoints
+          - Id: CleanupCheckpoints
+            Prefix: chainguard-sync/checkpoints/
+            Status: Enabled
+            ExpirationInDays: 1
+          - Id: CleanupErrors
+            Prefix: chainguard-sync/errors-
+            Status: Enabled
+            ExpirationInDays: 30
+          # All-versions-sync checkpoints
+          - Id: CleanupAllVersionsCheckpoints
+            Prefix: chainguard-sync-all/checkpoints/
+            Status: Enabled
+            ExpirationInDays: 1
+          - Id: CleanupAllVersionsErrors
+            Prefix: chainguard-sync-all/errors-
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ------------------------------------------------------------------
+  # Lambda: Sync lockfile versions only
+  # ------------------------------------------------------------------
+  SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: chainguard-codeartifact-sync
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 1024
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          CGR_USERNAME: !Ref CgrUsername
+          CGR_TOKEN: !Ref CgrToken
+          CODEARTIFACT_DOMAIN: !Ref CodeArtifactDomain
+          CODEARTIFACT_REPO: !Ref CodeArtifactRepo
+          CODEARTIFACT_UPSTREAM: !Ref CodeArtifactUpstream
+          ERRORS_S3_BUCKET: !Ref SyncBucket
+          ERRORS_S3_PREFIX: chainguard-sync/
+          CHECKPOINT_S3_BUCKET: !Ref SyncBucket
+          CHECKPOINT_S3_PREFIX: chainguard-sync/checkpoints/
+          CHECKPOINT_BUFFER_MS: '120000'
+          MAX_INVOCATIONS: !Ref MaxInvocations
+          MAX_PACKAGES: !Ref MaxPackages
+          LOG_LEVEL: DEBUG
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - codeartifact:CreateDomain
+                - codeartifact:CreateRepository
+                - codeartifact:UpdateRepository
+                - codeartifact:AssociateExternalConnection
+                - codeartifact:GetAuthorizationToken
+                - codeartifact:GetRepositoryEndpoint
+                - codeartifact:PutPackageOriginConfiguration
+                - codeartifact:PublishPackageVersion
+                - codeartifact:ListPackageVersions
+                - codeartifact:ListPackages
+                - codeartifact:DeletePackageVersions
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - sts:GetServiceBearerToken
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub '${SyncBucket.Arn}/*'
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt SyncBucket.Arn
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt SyncFunction.Arn
+
+  # ------------------------------------------------------------------
+  # Lambda: Sync ALL Chainguard versions
+  # ------------------------------------------------------------------
+  SyncAllVersionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: chainguard-codeartifact-sync-all
+      Handler: sync_all_versions.lambda_handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 1024
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          CGR_USERNAME: !Ref CgrUsername
+          CGR_TOKEN: !Ref CgrToken
+          CODEARTIFACT_DOMAIN: !Ref CodeArtifactDomain
+          CODEARTIFACT_REPO: !Ref CodeArtifactRepo
+          CODEARTIFACT_UPSTREAM: !Ref CodeArtifactUpstream
+          ERRORS_S3_BUCKET: !Ref SyncBucket
+          ERRORS_S3_PREFIX: chainguard-sync-all/
+          CHECKPOINT_S3_BUCKET: !Ref SyncBucket
+          CHECKPOINT_S3_PREFIX: chainguard-sync-all/checkpoints/
+          CHECKPOINT_BUFFER_MS: '120000'
+          MAX_INVOCATIONS: !Ref MaxInvocations
+          MAX_PACKAGES: !Ref MaxPackages
+          LOG_LEVEL: DEBUG
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - codeartifact:CreateDomain
+                - codeartifact:CreateRepository
+                - codeartifact:UpdateRepository
+                - codeartifact:AssociateExternalConnection
+                - codeartifact:GetAuthorizationToken
+                - codeartifact:GetRepositoryEndpoint
+                - codeartifact:PutPackageOriginConfiguration
+                - codeartifact:PublishPackageVersion
+                - codeartifact:ListPackageVersions
+                - codeartifact:ListPackages
+                - codeartifact:DeletePackageVersions
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - sts:GetServiceBearerToken
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub '${SyncBucket.Arn}/*'
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt SyncBucket.Arn
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt SyncAllVersionsFunction.Arn
+
+Outputs:
+  SyncFunctionArn:
+    Description: Lockfile-versions-only sync function
+    Value: !GetAtt SyncFunction.Arn
+  SyncFunctionName:
+    Value: !Ref SyncFunction
+  SyncAllVersionsFunctionArn:
+    Description: All-versions sync function
+    Value: !GetAtt SyncAllVersionsFunction.Arn
+  SyncAllVersionsFunctionName:
+    Value: !Ref SyncAllVersionsFunction
+  SyncBucketName:
+    Description: S3 bucket for errors, checkpoints, and lockfile uploads
+    Value: !Ref SyncBucket
+  SyncBucketArn:
+    Value: !GetAtt SyncBucket.Arn

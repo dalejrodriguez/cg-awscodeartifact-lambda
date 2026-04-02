@@ -544,6 +544,6 @@ cli_binary_format = raw-in-base64-out
 
 > **Note:** AWS CLI v1 sends raw payloads by default and does not need this flag.
 
-## License
+## License and Support
 
-Internal use. Chainguard Libraries access requires a valid Chainguard subscription.
+Internal use. Chainguard Libraries access requires a valid Chainguard subscription. This function is presented as is and is not officially supported by Chainguard. 

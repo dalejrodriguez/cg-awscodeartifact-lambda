@@ -8,8 +8,8 @@ Both functions read a `requirements.txt` from S3, resolve each package against C
 
 | Function | File | What it syncs |
 |---|---|---|
-| **Pinned-Only Sync** | `lambda_function_py_sync.py` | Exact `==` pinned versions from the requirements file only. |
-| **All-Versions Sync** | `py-sync-all.py` | Every version Chainguard publishes for each listed package (default), with a flag to fall back to pinned-only. |
+| **Pinned-Only Sync** | `lambda_function_.py` | Exact `==` pinned versions from the requirements file only. |
+| **All-Versions Sync** | `lambda_function_.py` | Every version Chainguard publishes for each listed package (default), with a flag to fall back to pinned-only. |
 
 Use **Pinned-Only** when you want a lean mirror that contains exactly what your lockfile declares. Use **All-Versions** when teams need the freedom to upgrade or downgrade within CodeArtifact without re-running a sync.
 

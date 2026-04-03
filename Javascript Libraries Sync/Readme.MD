@@ -13,13 +13,15 @@ This project deploys two Lambda functions and supporting infrastructure via AWS 
 
 Both functions share the same architecture: two-phase checkpointing, automatic continuation across Lambda invocations, error tracking, and garbage cleanup.
 
-# Screenshots :-) - Version specific mirroring example (Next.js):
+# Screenshot - Version specific mirroring example (accepts):
 
-![Alt text](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Nextjs-single-version.jpg)
+![Alt text](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Accepts%20-%20Single%20Version.png)
+
+# Screenshot - Multiple versions example (accepts):
+
+![Alt text](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Accepts%20-%20Multiple%20Versions.png)
 
 
-
-Automated Lambda functions that mirror NPM packages from [Chainguard Libraries](https://edu.chainguard.dev/chainguard/libraries/javascript/overview/) to AWS CodeArtifact. Provides supply-chain security by pulling vetted packages from Chainguard instead of public npm.
 
 ## Architecture
 

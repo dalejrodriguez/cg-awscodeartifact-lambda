@@ -38,3 +38,7 @@ Packages are routed to the correct registry automatically based on their version
 | CUDA 12.6 | `https://libraries.cgr.dev/cu126/simple/` | Version contains `+cu126` |
 | CUDA 12.8 | `https://libraries.cgr.dev/cu128/simple/` | Version contains `+cu128` |
 | CUDA 12.9 | `https://libraries.cgr.dev/cu129/simple/` | Version contains `+cu129` |
+
+## Architecture
+
+![Architecture diagram of lambda function](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Python%20Libraries%20Sync/architecture.svg)

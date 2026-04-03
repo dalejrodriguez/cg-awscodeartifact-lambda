@@ -15,11 +15,11 @@ Both functions share the same architecture: two-phase checkpointing, automatic c
 
 # Screenshot - Version specific mirroring example (accepts):
 
-![Alt text](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Accepts%20-%20Single%20Version.png)
+![Screenshot of a CodeArtifact repo with a specific npm package version synced](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Accepts%20-%20Single%20Version.png)
 
 # Screenshot - Multiple versions example (accepts):
 
-![Alt text](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Accepts%20-%20Multiple%20Versions.png)
+![Screenshot of a CodeArtifact repo with multiple npm package versions synced](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Accepts%20-%20Multiple%20Versions.png)
 
 
 ## Architecture

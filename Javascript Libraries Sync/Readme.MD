@@ -51,4 +51,4 @@ Checkpoints are saved to S3 and include the full state: work items, counters, er
 
 ## License and Support
 
-Internal use. Chainguard Libraries access requires a valid Chainguard subscription. This function is presented as is and is not officially supported by Chainguard. 
+Chainguard Libraries access requires a valid Chainguard subscription. This function is presented as is and is not officially supported by Chainguard. 

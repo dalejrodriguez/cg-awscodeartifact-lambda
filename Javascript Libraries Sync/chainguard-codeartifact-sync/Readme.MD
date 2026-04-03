@@ -1,6 +1,6 @@
 # Chainguard NPM → AWS CodeArtifact Sync Lambda
 
-An AWS Lambda function that synchronizes NPM packages from [Chainguard Libraries for JavaScript](https://libraries.cgr.dev/javascript) into an AWS CodeArtifact repository. It reads a `package-lock.json` file from S3, determines which package versions are available in Chainguard but missing from CodeArtifact, and publishes them — handling authentication, retries with exponential backoff, parallel downloads, checkpointing, and self-continuation across Lambda timeout boundaries.
+An AWS Lambda function that synchronizes NPM packages from [Chainguard Libraries for JavaScript](https://edu.chainguard.dev/chainguard/libraries/javascript/overview/) into an AWS CodeArtifact repository. It reads a `package-lock.json` file from S3, determines which package versions are available in Chainguard but missing from CodeArtifact, and publishes them — handling authentication, retries with exponential backoff, parallel downloads, checkpointing, and self-continuation across Lambda timeout boundaries.
 
 ---
 

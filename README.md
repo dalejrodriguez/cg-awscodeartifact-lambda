@@ -4,6 +4,8 @@ Syncs Python and Javascript packages from [Chainguard Libraries](https://librari
 
 These scripts are provided as is and are not officially supported by Chainguard. 
 
+This configuration does not support the Chainguard cool down repository. 
+
 ---
 
 ## Overview

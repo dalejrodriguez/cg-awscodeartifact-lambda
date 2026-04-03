@@ -22,7 +22,6 @@ Both functions share the same architecture: two-phase checkpointing, automatic c
 ![Alt text](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Accepts%20-%20Multiple%20Versions.png)
 
 
-
 ## Architecture
 
 ```
@@ -56,10 +55,6 @@ Invocation 4: Processing [items 401-900]      → complete
 ```
 
 Checkpoints are saved to S3 and include the full state: work items, counters, error list, and progress indices. On successful completion, checkpoint files are automatically deleted.
-
-### Auth Flow (Chainguard → S3 Redirect)
-
-Chainguard's npm registry returns 302 redirects from tarball URLs to presigned Cloudflare R2/S3 URLs. Python's `urllib` forwards the `Authorization` header on redirect, causing S3 to reject it. The functions use a custom `_StripAuthOnRedirectHandler` that removes the auth header before following redirects.
 
 ## Prerequisites
 

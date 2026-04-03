@@ -26,6 +26,45 @@ Parameters:
     Type: Number
     Description: Safety cap on self-re-invocations
     Default: 50
+  # --- New feature parameters ---
+  NotificationEmail:
+    Type: String
+    Description: Email address for SNS completion/failure notifications (leave empty to disable)
+    Default: ''
+  DryRun:
+    Type: String
+    Description: Default dry-run mode — preview without publishing (true/false)
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  PackageAllowlist:
+    Type: String
+    Description: Comma-separated glob patterns — only matching packages sync (e.g. "@types/*,lodash")
+    Default: ''
+  PackageDenylist:
+    Type: String
+    Description: Comma-separated glob patterns — matching packages are skipped (e.g. "debug,colors")
+    Default: ''
+  ParallelDownloads:
+    Type: Number
+    Description: Max concurrent tarball download threads
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+  RetryMaxAttempts:
+    Type: Number
+    Description: Max retry attempts for transient HTTP errors (429/5xx)
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+  RetryBaseDelay:
+    Type: String
+    Description: Base delay in seconds for exponential backoff (doubles each retry)
+    Default: '1.0'
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
 
 Resources:
   # ------------------------------------------------------------------
@@ -64,6 +103,26 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+
+  # ------------------------------------------------------------------
+  # SNS Topic for sync notifications (created only if email provided)
+  # ------------------------------------------------------------------
+  SyncNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-sync-notifications'
+      Tags:
+        - Key: Project
+          Value: chainguard-npm-sync
+
+  SyncNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref SyncNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
 
   # ------------------------------------------------------------------
   # Lambda: Sync lockfile versions only
@@ -129,7 +188,7 @@ Resources:
               Resource: !GetAtt SyncFunction.Arn
 
   # ------------------------------------------------------------------
-  # Lambda: Sync ALL Chainguard versions
+  # Lambda: Sync ALL Chainguard versions (enhanced)
   # ------------------------------------------------------------------
   SyncAllVersionsFunction:
     Type: AWS::Serverless::Function
@@ -155,9 +214,18 @@ Resources:
           CHECKPOINT_BUFFER_MS: '120000'
           MAX_INVOCATIONS: !Ref MaxInvocations
           LOG_LEVEL: DEBUG
+          # --- New feature env vars ---
+          SNS_TOPIC_ARN: !If [HasNotificationEmail, !Ref SyncNotificationTopic, '']
+          DRY_RUN: !Ref DryRun
+          PACKAGE_ALLOWLIST: !Ref PackageAllowlist
+          PACKAGE_DENYLIST: !Ref PackageDenylist
+          PARALLEL_DOWNLOADS: !Ref ParallelDownloads
+          RETRY_MAX_ATTEMPTS: !Ref RetryMaxAttempts
+          RETRY_BASE_DELAY: !Ref RetryBaseDelay
       Policies:
         - Version: '2012-10-17'
           Statement:
+            # --- CodeArtifact (unchanged) ---
             - Effect: Allow
               Action:
                 - codeartifact:CreateDomain
@@ -176,6 +244,7 @@ Resources:
               Action:
                 - sts:GetServiceBearerToken
               Resource: '*'
+            # --- S3 (unchanged) ---
             - Effect: Allow
               Action:
                 - s3:GetObject
@@ -186,10 +255,24 @@ Resources:
               Action:
                 - s3:ListBucket
               Resource: !GetAtt SyncBucket.Arn
+            # --- Self-invoke (unchanged) ---
             - Effect: Allow
               Action:
                 - lambda:InvokeFunction
               Resource: !GetAtt SyncAllVersionsFunction.Arn
+            # --- SNS notifications (new) ---
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !If
+                - HasNotificationEmail
+                - !Ref SyncNotificationTopic
+                - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*'
+            # --- CloudWatch custom metrics (new) ---
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
 
 Outputs:
   SyncFunctionArn:
@@ -198,7 +281,7 @@ Outputs:
   SyncFunctionName:
     Value: !Ref SyncFunction
   SyncAllVersionsFunctionArn:
-    Description: All-versions sync function
+    Description: All-versions sync function (enhanced with notifications, dry-run, parallel, retry, filtering, metrics)
     Value: !GetAtt SyncAllVersionsFunction.Arn
   SyncAllVersionsFunctionName:
     Value: !Ref SyncAllVersionsFunction
@@ -207,3 +290,7 @@ Outputs:
     Value: !Ref SyncBucket
   SyncBucketArn:
     Value: !GetAtt SyncBucket.Arn
+  SyncNotificationTopicArn:
+    Condition: HasNotificationEmail
+    Description: SNS topic ARN for sync completion/failure notifications
+    Value: !Ref SyncNotificationTopic

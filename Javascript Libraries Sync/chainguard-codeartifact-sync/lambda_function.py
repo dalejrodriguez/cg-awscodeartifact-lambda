@@ -11,7 +11,10 @@ Trigger:
 {
     "s3_bucket": "my-bucket",
     "s3_key": "path/to/package-lock.json",
-    "setup_codeartifact": false         // optional, default false
+    "setup_codeartifact": false,        // optional, default false
+    "dry_run": false,                   // optional — preview without publishing
+    "allowlist": ["@scope/*", "pkg"],   // optional — only sync these patterns
+    "denylist": ["unwanted-pkg"]        // optional — skip these patterns
 }
 
 Resume a previous run:
@@ -35,6 +38,14 @@ Environment variables:
     MAX_INVOCATIONS         — safety cap on re-invocations   (default: 50)
     MAX_PACKAGES            — max packages to process per run (default: 50000)
     LOG_LEVEL               — DEBUG / INFO / WARN  (default: DEBUG)
+    SNS_TOPIC_ARN           — SNS topic for completion/failure notifications
+    PARALLEL_DOWNLOADS      — max concurrent tarball downloads (default: 5)
+    MAX_RETRIES             — max retry attempts for HTTP errors (default: 3)
+    RETRY_BASE_DELAY        — base delay in seconds for backoff (default: 1.0)
+    CW_METRICS_NAMESPACE    — CloudWatch namespace   (default: ChainguardSync)
+    CW_METRICS_ENABLED      — enable CloudWatch metrics (default: true)
+    ALLOWLIST               — JSON array of package patterns to include
+    DENYLIST                — JSON array of package patterns to exclude
 """
 
 import json
@@ -42,10 +53,13 @@ import os
 import base64
 import hashlib
 import logging
+import time
+import fnmatch
 import urllib.request
 import urllib.error
 import urllib.parse
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from botocore.exceptions import ClientError
@@ -89,6 +103,36 @@ MAX_PACKAGES = int(os.environ.get("MAX_PACKAGES", "50000"))
 FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "chainguard-codeartifact-sync")
 
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+
+# SNS notifications
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+sns_client = boto3.client("sns", region_name=AWS_REGION) if SNS_TOPIC_ARN else None
+
+# Parallel downloads
+PARALLEL_DOWNLOADS = int(os.environ.get("PARALLEL_DOWNLOADS", "5"))
+
+# Retry configuration
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+RETRY_BASE_DELAY = float(os.environ.get("RETRY_BASE_DELAY", "1.0"))
+
+# CloudWatch custom metrics
+CW_METRICS_NAMESPACE = os.environ.get("CW_METRICS_NAMESPACE", "ChainguardSync")
+CW_METRICS_ENABLED = os.environ.get("CW_METRICS_ENABLED", "true").lower() == "true"
+cw_client = boto3.client("cloudwatch", region_name=AWS_REGION) if CW_METRICS_ENABLED else None
+
+# Package allowlist / denylist (from env — can be overridden per-invocation)
+def _parse_json_list(env_var: str) -> list[str]:
+    raw = os.environ.get(env_var, "")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+ENV_ALLOWLIST = _parse_json_list("ALLOWLIST")
+ENV_DENYLIST = _parse_json_list("DENYLIST")
 
 
 # ===================================================================
@@ -176,6 +220,157 @@ def handle_http_error(exc: Exception, package: str, phase: str,
         tracker.record(package=package, phase=phase,
                        error_type=type(exc).__name__,
                        status_code=None, detail=str(exc))
+
+
+# ===================================================================
+# Retry with exponential backoff
+# ===================================================================
+def _retry_with_backoff(fn, max_retries: int = MAX_RETRIES,
+                        base_delay: float = RETRY_BASE_DELAY,
+                        retryable_codes: tuple = (429, 500, 502, 503, 504)):
+    """Execute fn() with exponential backoff on retryable HTTP errors.
+
+    Returns the result of fn() on success.
+    Raises the last exception if all retries are exhausted.
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code not in retryable_codes or attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning("Retry %d/%d for HTTP %d — waiting %.1fs",
+                           attempt + 1, max_retries, exc.code, delay)
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning("Retry %d/%d for %s — waiting %.1fs",
+                           attempt + 1, max_retries,
+                           type(exc).__name__, delay)
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
+# ===================================================================
+# SNS notifications
+# ===================================================================
+def _send_notification(subject: str, message: str,
+                       status: str = "info") -> None:
+    """Publish a notification to the configured SNS topic.
+    Silently skips if SNS_TOPIC_ARN is not set.
+    """
+    if not SNS_TOPIC_ARN or not sns_client:
+        return
+    try:
+        # Prefix subject with status for easy email filtering
+        tag = {"complete": "SUCCESS", "error": "FAILURE",
+               "info": "INFO"}.get(status, "INFO")
+        full_subject = f"[ChainguardSync] [{tag}] {subject}"[:100]
+
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=full_subject,
+            Message=message,
+        )
+        logger.info("SNS notification sent: %s", full_subject)
+    except Exception as exc:
+        logger.warning("Failed to send SNS notification: %s", exc)
+
+
+# ===================================================================
+# CloudWatch custom metrics
+# ===================================================================
+def _put_metrics(counters: dict, run_id: str,
+                 extra: Optional[dict] = None) -> None:
+    """Emit CloudWatch custom metrics for the sync run."""
+    if not CW_METRICS_ENABLED or not cw_client:
+        return
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc)
+        dimensions = [
+            {"Name": "Domain", "Value": DOMAIN_NAME},
+            {"Name": "Repository", "Value": REPO_NAME},
+        ]
+        metric_data = [
+            {"MetricName": "PackagesSynced",
+             "Timestamp": ts, "Value": counters.get("found", 0),
+             "Unit": "Count", "Dimensions": dimensions},
+            {"MetricName": "PackagesFailed",
+             "Timestamp": ts, "Value": counters.get("failed", 0),
+             "Unit": "Count", "Dimensions": dimensions},
+            {"MetricName": "PackagesSkipped",
+             "Timestamp": ts, "Value": counters.get("skipped_existing", 0),
+             "Unit": "Count", "Dimensions": dimensions},
+            {"MetricName": "TarballDownloadFailed",
+             "Timestamp": ts, "Value": counters.get("not_found", 0),
+             "Unit": "Count", "Dimensions": dimensions},
+            {"MetricName": "HttpErrors",
+             "Timestamp": ts, "Value": counters.get("http_errors", 0),
+             "Unit": "Count", "Dimensions": dimensions},
+        ]
+        if extra:
+            for name, value in extra.items():
+                metric_data.append({
+                    "MetricName": name, "Timestamp": ts,
+                    "Value": value, "Unit": "Count",
+                    "Dimensions": dimensions})
+
+        # CloudWatch accepts up to 1000 metrics per call; we're well under
+        cw_client.put_metric_data(
+            Namespace=CW_METRICS_NAMESPACE, MetricData=metric_data)
+        logger.info("Published %d CloudWatch metrics", len(metric_data))
+    except Exception as exc:
+        logger.warning("Failed to publish CloudWatch metrics: %s", exc)
+
+
+# ===================================================================
+# Package allowlist / denylist filtering
+# ===================================================================
+def _matches_patterns(name: str, patterns: list[str]) -> bool:
+    """Check if a package name matches any of the given glob patterns.
+
+    Supports:
+      - Exact match:  "lodash"
+      - Scope glob:   "@scope/*"
+      - Wildcards:    "*lodash*"
+    """
+    for pattern in patterns:
+        if fnmatch.fnmatch(name, pattern):
+            return True
+    return False
+
+
+def filter_packages(names: list[str], allowlist: list[str],
+                    denylist: list[str]) -> list[str]:
+    """Apply allowlist and denylist filtering to a list of package names.
+
+    - If allowlist is non-empty, only packages matching at least one
+      allowlist pattern are kept.
+    - Then, any packages matching a denylist pattern are removed.
+    """
+    original_count = len(names)
+
+    if allowlist:
+        names = [n for n in names if _matches_patterns(n, allowlist)]
+        logger.info("Allowlist filter: %d -> %d packages",
+                     original_count, len(names))
+
+    if denylist:
+        before = len(names)
+        names = [n for n in names if not _matches_patterns(n, denylist)]
+        logger.info("Denylist filter: %d -> %d packages", before, len(names))
+
+    if original_count != len(names):
+        logger.info("Package filtering: %d -> %d packages after allow/denylist",
+                     original_count, len(names))
+    return names
 
 
 # ===================================================================
@@ -305,18 +500,23 @@ _cgr_opener = urllib.request.build_opener(_StripAuthOnRedirectHandler)
 def fetch_chainguard_metadata(name: str, tracker: ErrorTracker) -> Optional[dict]:
     """Fetch full package metadata from Chainguard (all versions).
     Returns parsed JSON dict or None if not found.
+    Uses exponential backoff on retryable HTTP errors.
     """
     encoded_name = urllib.parse.quote(name, safe="@")
     metadata_url = f"{CGR_REGISTRY}/{encoded_name}"
     auth = _cgr_auth_header()
 
     logger.debug("Fetching registry metadata: %s", metadata_url)
-    req = urllib.request.Request(metadata_url, headers={
-        "Authorization": auth, "Accept": "application/json",
-    })
-    try:
+
+    def _do_fetch():
+        req = urllib.request.Request(metadata_url, headers={
+            "Authorization": auth, "Accept": "application/json",
+        })
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read())
+
+    try:
+        return _retry_with_backoff(_do_fetch)
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 401, 403):
             logger.debug("Metadata not found for %s (%s)", name, exc.code)
@@ -335,15 +535,20 @@ def download_tarball(tarball_url: str, name: str, version: str,
                      tracker: ErrorTracker) -> Optional[bytes]:
     """Download a tarball using the auth-stripping opener.
     Returns bytes on success, None on failure.
+    Uses exponential backoff on retryable HTTP errors.
     """
     pkg_id = f"{name}@{version}"
     auth = _cgr_auth_header()
 
     logger.debug("Downloading tarball for %s: %s", pkg_id, tarball_url)
-    tar_req = urllib.request.Request(tarball_url, headers={"Authorization": auth})
-    try:
+
+    def _do_download():
+        tar_req = urllib.request.Request(tarball_url, headers={"Authorization": auth})
         with _cgr_opener.open(tar_req, timeout=120) as resp:
             return resp.read()
+
+    try:
+        return _retry_with_backoff(_do_download)
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 401, 403):
             logger.debug("Tarball download failed for %s (%s)", pkg_id, exc.code)
@@ -579,6 +784,7 @@ def publish_to_codeartifact(
 ) -> bool:
     """Publish a tarball to CodeArtifact using the npm registry PUT protocol.
     Returns True on success (including 'already exists').
+    Uses exponential backoff on retryable HTTP errors.
 
     Note: CodeArtifact's PublishPackageVersion API does NOT support npm.
     npm packages must be published via the npm registry PUT protocol.
@@ -624,19 +830,23 @@ def publish_to_codeartifact(
 
     encoded_name = urllib.parse.quote(name, safe="@")
     put_url = f"{endpoint.rstrip('/')}/{encoded_name}"
+    payload_bytes = json.dumps(payload).encode()
 
     logger.debug("Publishing %s — PUT %s — attachment_key=%s",
                   pkg_id, put_url, tarball_name)
 
-    req = urllib.request.Request(
-        put_url, data=json.dumps(payload).encode(), method="PUT",
-        headers={"Authorization": f"Bearer {auth_token}",
-                 "Content-Type": "application/json"})
+    def _do_publish():
+        req = urllib.request.Request(
+            put_url, data=payload_bytes, method="PUT",
+            headers={"Authorization": f"Bearer {auth_token}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.status
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            logger.info("Published %s@%s (%s)", name, version, resp.status)
-            return True
+        status = _retry_with_backoff(_do_publish)
+        logger.info("Published %s@%s (%s)", name, version, status)
+        return True
     except urllib.error.HTTPError as exc:
         body = ""
         try:
@@ -1006,6 +1216,10 @@ def lambda_handler(event, context):
 
     Options:
        "cleanup_garbage": true/false  — run cleanup before new sessions (default: true)
+       "dry_run": true/false          — preview sync plan without publishing (default: false)
+       "allowlist": ["@scope/*"]      — only sync packages matching these patterns
+       "denylist": ["unwanted-pkg"]   — skip packages matching these patterns
+       "parallel_downloads": N        — override PARALLEL_DOWNLOADS for this run
     """
     # ------------------------------------------------------------------
     # Mode: list checkpoints
@@ -1032,6 +1246,13 @@ def lambda_handler(event, context):
                          or event.get("errors_s3_bucket", ERRORS_S3_BUCKET))
     is_update_existing = event.get("update_existing", False)
     do_cleanup = event.get("cleanup_garbage", True)
+    dry_run = event.get("dry_run", False)
+    allowlist = event.get("allowlist", ENV_ALLOWLIST) or []
+    denylist = event.get("denylist", ENV_DENYLIST) or []
+    parallel = int(event.get("parallel_downloads", PARALLEL_DOWNLOADS))
+
+    if dry_run:
+        logger.info("DRY RUN mode — no packages will be published")
 
     # ------------------------------------------------------------------
     # Determine entry mode
@@ -1135,6 +1356,13 @@ def lambda_handler(event, context):
         if not package_names:
             return _success("No packages to process", _empty_summary())
 
+        # Apply allowlist / denylist filtering
+        if allowlist or denylist:
+            package_names = filter_packages(package_names, allowlist, denylist)
+            if not package_names:
+                return _success("No packages remaining after allow/denylist filtering",
+                                _empty_summary())
+
         # Enforce max_packages limit
         if len(package_names) > max_packages:
             logger.warning("Package list (%d) exceeds max_packages (%d) — truncating",
@@ -1147,9 +1375,11 @@ def lambda_handler(event, context):
     if invocation_number > MAX_INVOCATIONS:
         logger.error("MAX_INVOCATIONS=%d reached for run %s", MAX_INVOCATIONS, run_id)
         _flush_errors(tracker, original_event)
-        return _error(
-            f"Exceeded max invocations ({MAX_INVOCATIONS}). "
-            f"Resume with: {{\"resume_run_id\": \"{run_id}\"}}")
+        msg = (f"Exceeded max invocations ({MAX_INVOCATIONS}). "
+               f"Resume with: {{\"resume_run_id\": \"{run_id}\"}}")
+        _send_notification(f"Sync STOPPED — max invocations ({MAX_INVOCATIONS})",
+                           msg, status="error")
+        return _error(msg)
 
     # ==================================================================
     # PHASE 1: DISCOVERY — checkpointable
@@ -1261,18 +1491,45 @@ def lambda_handler(event, context):
                    f"{len(package_names)}: {type(exc).__name__}: {str(exc)[:200]}")
             if saved:
                 msg += f'. Resume with: {{"resume_run_id": "{saved}"}}'
+            _send_notification(f"Sync FAILED during discovery — {type(exc).__name__}",
+                               msg, status="error")
             return _error(msg)
 
         logger.info("Discovery complete — %d work items from %d packages",
                      len(work_items), len(package_names))
 
         if not work_items:
-            return _success(
+            result = _success(
                 "No new versions to sync — all up to date or not in Chainguard",
                 {**_empty_summary(), "run_id": run_id,
                  "total_packages_checked": len(package_names),
                  "skipped_existing": counters["skipped_existing"],
                  "not_found_packages": not_found_list})
+            _put_metrics(counters, run_id)
+            _send_notification("Sync complete — already up to date",
+                               json.dumps(result["body"], indent=2),
+                               status="complete")
+            return result
+
+        # ---- DRY RUN: return the plan without publishing ----
+        if dry_run:
+            dry_summary = {
+                "run_id": run_id,
+                "dry_run": True,
+                "total_work_items": len(work_items),
+                "skipped_existing": counters["skipped_existing"],
+                "not_found_packages": not_found_list,
+                "packages_to_sync": [
+                    f'{w["name"]}@{w["version"]}' for w in work_items
+                ],
+                "status": "dry_run_complete",
+            }
+            logger.info("Dry run complete — %d items would be synced",
+                         len(work_items))
+            _send_notification(
+                f"Dry run complete — {len(work_items)} packages would sync",
+                json.dumps(dry_summary, indent=2), status="info")
+            return _success("Dry run complete — no changes made", dry_summary)
 
         # Transition to processing phase
         phase = "processing"
@@ -1280,6 +1537,7 @@ def lambda_handler(event, context):
 
     # ==================================================================
     # PHASE 2: PROCESSING — download tarballs and publish
+    # Supports parallel tarball downloads via ThreadPoolExecutor
     # ==================================================================
     endpoint = ca_client.get_repository_endpoint(
         domain=DOMAIN_NAME, repository=REPO_NAME, format="npm",
@@ -1289,11 +1547,12 @@ def lambda_handler(event, context):
     current_index = processing_index
     timed_out = False
 
-    logger.info("Processing phase — %d work items starting at %d",
-                 len(work_items), processing_index)
+    logger.info("Processing phase — %d work items starting at %d (parallel=%d)",
+                 len(work_items), processing_index, parallel)
 
     try:
-        for i in range(processing_index, len(work_items)):
+        i = processing_index
+        while i < len(work_items):
             if _is_time_running_out(context):
                 logger.warning("Low on time at item %d/%d — checkpointing",
                                i, len(work_items))
@@ -1301,23 +1560,63 @@ def lambda_handler(event, context):
                 current_index = i
                 break
 
-            item = work_items[i]
-            name, version = item["name"], item["version"]
-            tarball_url = item["tarball_url"]
-            logger.info("[%d/%d] %s@%s", i + 1, len(work_items), name, version)
+            # Build a batch for parallel download
+            batch_end = min(i + parallel, len(work_items))
+            batch = work_items[i:batch_end]
 
-            tarball = download_tarball(tarball_url, name, version, tracker)
-            if tarball is None:
-                counters["not_found"] += 1
-                not_found_list.append(f"{name}@{version}")
-                logger.info("  Tarball download failed")
+            # Check time before committing to a batch
+            if len(batch) > 1 and _is_time_running_out(context):
+                timed_out = True
+                current_index = i
+                break
+
+            # Parallel download tarballs
+            download_results: list[tuple[dict, Optional[bytes]]] = []
+
+            if parallel > 1 and len(batch) > 1:
+                with ThreadPoolExecutor(max_workers=min(parallel, len(batch))) as pool:
+                    futures = {
+                        pool.submit(
+                            download_tarball, item["tarball_url"],
+                            item["name"], item["version"], tracker
+                        ): item
+                        for item in batch
+                    }
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try:
+                            tarball = future.result()
+                        except Exception as exc:
+                            logger.error("Parallel download exception for %s@%s: %s",
+                                         item["name"], item["version"], exc)
+                            tarball = None
+                        download_results.append((item, tarball))
             else:
-                counters["found"] += 1
-                if not publish_to_codeartifact(name, version, tarball,
-                                               endpoint, auth_token, tracker):
-                    counters["failed"] += 1
+                # Sequential fallback for single items or parallel=1
+                for item in batch:
+                    tarball = download_tarball(
+                        item["tarball_url"], item["name"],
+                        item["version"], tracker)
+                    download_results.append((item, tarball))
 
-            current_index = i + 1
+            # Publish sequentially (CodeArtifact doesn't handle parallel PUTs well)
+            for item, tarball in download_results:
+                name, version = item["name"], item["version"]
+                logger.info("[%d/%d] %s@%s",
+                            i + 1, len(work_items), name, version)
+
+                if tarball is None:
+                    counters["not_found"] += 1
+                    not_found_list.append(f"{name}@{version}")
+                    logger.info("  Tarball download failed")
+                else:
+                    counters["found"] += 1
+                    if not publish_to_codeartifact(name, version, tarball,
+                                                   endpoint, auth_token, tracker):
+                        counters["failed"] += 1
+                i += 1
+
+            current_index = i
 
     except Exception as exc:
         logger.error("Unexpected error at item %d/%d: %s",
@@ -1331,6 +1630,9 @@ def lambda_handler(event, context):
                f"{type(exc).__name__}: {str(exc)[:200]}")
         if saved:
             msg += f'. Resume with: {{"resume_run_id": "{saved}"}}'
+        _put_metrics({**counters, "http_errors": tracker.count}, run_id)
+        _send_notification(f"Sync FAILED — {type(exc).__name__}", msg,
+                           status="error")
         return _error(msg)
 
     # ------------------------------------------------------------------
@@ -1386,6 +1688,19 @@ def lambda_handler(event, context):
         "status": "complete",
     }
     logger.info("Sync complete — %s", json.dumps(summary, indent=2))
+
+    # Emit CloudWatch metrics
+    _put_metrics({**counters, "http_errors": tracker.count}, run_id,
+                 extra={"TotalWorkItems": len(work_items)})
+
+    # Send SNS notification
+    has_errors = tracker.count > 0 or counters["failed"] > 0
+    notif_status = "error" if has_errors else "complete"
+    notif_subject = (f"Sync complete — {counters['found']} synced"
+                     f"{', ' + str(tracker.count) + ' errors' if has_errors else ''}")
+    _send_notification(notif_subject, json.dumps(summary, indent=2),
+                       status=notif_status)
+
     return _success("Sync complete", summary)
 
 

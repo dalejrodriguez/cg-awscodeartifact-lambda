@@ -1,549 +1,1036 @@
-# Chainguard → AWS CodeArtifact NPM Sync
+# Chainguard → CodeArtifact NPM Sync Lambda
 
-Automated Lambda functions that mirror NPM packages from [Chainguard Libraries](https://libraries.cgr.dev) to AWS CodeArtifact. Provides supply-chain security by pulling vetted packages from Chainguard instead of public npm.
+Sync **all** Chainguard NPM package versions to an AWS CodeArtifact repository. For each unique package name found in a `package-lock.json` lockfile, the Lambda fetches every version available from Chainguard Libraries, diffs against what exists in CodeArtifact, and publishes only new versions.
 
-## Overview
+The function is designed for long-running syncs: it auto-checkpoints to S3 when the Lambda timeout approaches, re-invokes itself, and resumes from where it left off — fully hands-free.
 
-This project deploys two Lambda functions and supporting infrastructure via AWS SAM:
+---
 
-| Function | Handler | Purpose |
-|---|---|---|
-| `chainguard-codeartifact-sync` | `lambda_function.lambda_handler` | Sync **exact lockfile versions** — mirrors only the specific versions your project uses |
-| `chainguard-codeartifact-sync-all` | `sync_all_versions.lambda_handler` | Sync **all available versions** — fully populates your CodeArtifact mirror for every package in the lockfile |
+## Table of Contents
 
-Both functions share the same architecture: two-phase checkpointing, automatic continuation across Lambda invocations, error tracking, and garbage cleanup.
+- [Features](#features)
+- [Architecture Overview](#architecture-overview)
+- [Environment Variables](#environment-variables)
+- [Invocation Payloads](#invocation-payloads)
+- [Feature Details](#feature-details)
+  - [SNS/Email Notifications](#snsemail-notifications)
+  - [Dry-Run Mode](#dry-run-mode)
+  - [Parallel Tarball Downloads](#parallel-tarball-downloads)
+  - [Retry Logic with Exponential Backoff](#retry-logic-with-exponential-backoff)
+  - [Package Allowlist / Denylist](#package-allowlist--denylist)
+  - [CloudWatch Custom Metrics](#cloudwatch-custom-metrics)
+- [Cron Job Setup (EventBridge Scheduler)](#cron-job-setup-eventbridge-scheduler)
+  - [Console Setup](#console-setup)
+  - [AWS CLI Setup](#aws-cli-setup)
+  - [Common Schedules](#common-schedules)
+- [Terraform Deployment](#terraform-deployment)
+  - [Project Structure](#project-structure)
+  - [Full Terraform Configuration](#full-terraform-configuration)
+  - [Deploying](#deploying)
+  - [Variables Reference](#variables-reference)
+  - [Outputs Reference](#outputs-reference)
+- [Monitoring & Alerting](#monitoring--alerting)
+- [Troubleshooting](#troubleshooting)
 
-## Architecture
+---
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **SNS/Email Notifications** | Get notified on completion or failure via SNS (email, Slack, PagerDuty, etc.) |
+| **Dry-Run Mode** | Preview what would sync without publishing anything |
+| **Parallel Downloads** | Configurable thread pool for concurrent tarball downloads |
+| **Retry with Backoff** | Exponential backoff on HTTP 429/5xx errors with configurable attempts |
+| **Allowlist / Denylist** | Glob-pattern filtering (`@types/*`, `lodash`, `*-loader`) |
+| **CloudWatch Metrics** | Custom metrics: PackagesSynced, PackagesFailed, PackagesSkipped, etc. |
+| **Checkpointing** | Auto-saves to S3 before timeout, self-invokes to continue |
+| **Garbage Cleanup** | Removes malformed packages from previous parser bugs |
+
+---
+
+## Architecture Overview
 
 ```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐     ┌──────────────┐
-│  S3 Bucket   │────▶│  Lambda Function  │────▶│  Chainguard     │────▶│ CodeArtifact │
-│ (lockfile)   │     │  (sync engine)    │     │  Libraries      │     │ (npm mirror) │
-└─────────────┘     └──────────────────┘     └─────────────────┘     └──────────────┘
-                           │     ▲
-                           │     │ self-invoke on timeout
-                           ▼     │
-                     ┌──────────────────┐
-                     │  S3 Bucket       │
-                     │  (checkpoints    │
-                     │   + errors)      │
-                     └──────────────────┘
+┌──────────────┐       ┌────────────────────┐       ┌──────────────────┐
+│  EventBridge │──────▶│  Lambda Function    │──────▶│  CodeArtifact    │
+│  (cron/rate) │       │                    │       │  (npm registry)  │
+└──────────────┘       │  1. Parse lockfile  │       └──────────────────┘
+                       │  2. Filter packages │
+┌──────────────┐       │  3. Discover diffs  │       ┌──────────────────┐
+│  S3 Bucket   │◀─────▶│  4. Download (‖)    │◀─────▶│  Chainguard      │
+│  (lockfile,  │       │  5. Publish         │       │  Libraries       │
+│  checkpoints)│       │  6. Notify + Metrics│       └──────────────────┘
+└──────────────┘       └────────────────────┘
+                              │        │
+                              ▼        ▼
+                        ┌─────────┐ ┌──────────┐
+                        │   SNS   │ │CloudWatch│
+                        │ (email) │ │ (metrics)│
+                        └─────────┘ └──────────┘
 ```
 
-### Two-Phase Checkpointing
-
-Large lockfiles (50,000+ packages) cannot be processed in a single 15-minute Lambda invocation. The function splits work into two checkpointable phases:
-
-**Phase 1 — Discovery:** Iterates package names, fetches metadata from Chainguard, diffs against CodeArtifact, and builds a work items list. Checks remaining execution time before each package and saves a checkpoint if running low.
-
-**Phase 2 — Processing:** Iterates work items, downloads tarballs from Chainguard, and publishes to CodeArtifact via the npm PUT protocol. Same time-check and checkpoint behavior.
-
-```
-Invocation 1: Discovery [packages 1-800]     → checkpoint → self-invoke
-Invocation 2: Discovery [packages 801-1500]   → checkpoint → self-invoke
-Invocation 3: Discovery [1501-2000] complete  → Processing [items 1-400] → checkpoint
-Invocation 4: Processing [items 401-900]      → complete
-```
-
-Checkpoints are saved to S3 and include the full state: work items, counters, error list, and progress indices. On successful completion, checkpoint files are automatically deleted.
-
-### Auth Flow (Chainguard → S3 Redirect)
-
-Chainguard's npm registry returns 302 redirects from tarball URLs to presigned Cloudflare R2/S3 URLs. Python's `urllib` forwards the `Authorization` header on redirect, causing S3 to reject it. The functions use a custom `_StripAuthOnRedirectHandler` that removes the auth header before following redirects.
-
-## Prerequisites
-
-- AWS CLI and SAM CLI installed
-- Chainguard Libraries credentials (`CGR_USERNAME` and `CGR_TOKEN`)
-- An AWS account with permissions to create Lambda, S3, CodeArtifact, and IAM resources
-
-## Deployment
-
-### Deploy with SAM
-
-```bash
-sam build
-sam deploy --guided \
-    --parameter-overrides \
-        CgrUsername=<your-chainguard-username> \
-        CgrToken=<your-chainguard-token> \
-        CodeArtifactDomain=my-npm-domain \
-        CodeArtifactRepo=my-npm-repo
-```
-
-The SAM template creates:
-
-- **S3 Bucket** — for checkpoints, error logs, and lockfile uploads. Lifecycle rules auto-delete checkpoints after 1 day and error logs after 30 days.
-- **Two Lambda Functions** — lockfile sync and all-versions sync, both with arm64/1024MB/15min timeout.
-- **IAM Policies** — scoped CodeArtifact, S3, STS, and Lambda self-invoke permissions.
-
-### SAM Parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `CgrUsername` | *(required)* | Chainguard registry username |
-| `CgrToken` | *(required)* | Chainguard registry token |
-| `CodeArtifactDomain` | `my-npm-domain` | CodeArtifact domain name |
-| `CodeArtifactRepo` | `my-npm-repo` | CodeArtifact repository name |
-| `CodeArtifactUpstream` | `npm-public` | Upstream repo name (public npm fallback) |
-| `MaxInvocations` | `50` | Safety cap on self-re-invocations per run |
-| `MaxPackages` | `50000` | Max packages to process per run |
-
-### First-Time CodeArtifact Setup
-
-If your CodeArtifact domain and repository don't exist yet, include `"setup_codeartifact": true` in your first invocation. This idempotently creates the domain, upstream repository, npm external connection, and main repository.
-
-## Usage
-
-### Upload Your Lockfile to S3
-
-```bash
-aws s3 cp package-lock.json s3://<sync-bucket>/lockfiles/package-lock.json
-```
-
-### Function 1: Sync Lockfile Versions Only
-
-Syncs the exact `name@version` pairs from your lockfile. Best for CI/CD pipelines where you want to mirror exactly what your project depends on.
-
-```bash
-# Start a new sync
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --invocation-type Event \
-    --payload '{
-        "s3_bucket": "<sync-bucket>",
-        "s3_key": "lockfiles/package-lock.json"
-    }' response.json
-```
-
-### Function 2: Sync All Versions
-
-For each package in your lockfile, syncs **every version** available in Chainguard. Best for building a fully populated mirror.
-
-```bash
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync-all \
-    --cli-binary-format raw-in-base64-out \
-    --invocation-type Event \
-    --payload '{
-        "s3_bucket": "<sync-bucket>",
-        "s3_key": "lockfiles/package-lock.json"
-    }' response.json
-```
-
-### Update Existing Packages
-
-Check all packages already in your CodeArtifact repository for new versions in Chainguard. No lockfile required — it scans your CodeArtifact repo directly.
-
-```bash
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --invocation-type Event \
-    --payload '{"update_existing": true}' response.json
-```
-
-This is ideal for scheduled runs to keep your mirror current.
-
-### List Checkpoints (Resumable Sessions)
-
-```bash
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --cli-read-timeout 900 \
-    --payload '{"list_checkpoints": true}' response.json
-
-cat response.json
-```
-
-Returns:
-
-```json
-{
-    "statusCode": 200,
-    "body": {
-        "message": "Found 2 checkpoint(s)",
-        "summary": {
-            "checkpoints": [
-                {
-                    "run_id": "20260402T034658Z-abc12345",
-                    "next_index": 142,
-                    "total_work_items": 500,
-                    "invocation_number": 3,
-                    "counters": {"found": 130, "not_found": 8, "failed": 4},
-                    "last_modified": "2026-04-02T03:50:00+00:00",
-                    "resume_with": {"resume_run_id": "20260402T034658Z-abc12345"}
-                }
-            ],
-            "status": "listing"
-        }
-    }
-}
-```
-
-### Resume a Previous Run
-
-```bash
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --invocation-type Event \
-    --payload '{"resume_run_id": "20260402T034658Z-abc12345"}' response.json
-```
-
-Resumes from exactly where the previous run stopped — no work is repeated.
-
-### Cleanup Garbage Packages
-
-Removes packages with `node_modules` in their name (artifacts from a previous parser bug). Runs automatically before every new session by default.
-
-```bash
-# Cleanup only (no sync)
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --cli-read-timeout 900 \
-    --payload '{"cleanup_only": true}' response.json
-
-# Disable automatic cleanup for a specific run
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --invocation-type Event \
-    --payload '{
-        "s3_bucket": "<sync-bucket>",
-        "s3_key": "lockfiles/package-lock.json",
-        "cleanup_garbage": false
-    }' response.json
-```
-
-### Inline Lockfile (Small Projects)
-
-For lockfiles under 6MB, you can pass the content directly without S3:
-
-```bash
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --cli-read-timeout 900 \
-    --payload "$(jq -n --arg lf "$(cat package-lock.json)" '{
-        "lockfile_content": $lf
-    }')" response.json
-```
-
-### Override Max Packages
-
-By default, the function processes up to 50,000 packages per run. Override per-invocation for larger monorepos:
-
-```bash
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --invocation-type Event \
-    --payload '{
-        "s3_bucket": "<sync-bucket>",
-        "s3_key": "lockfiles/package-lock.json",
-        "max_packages": 100000
-    }' response.json
-```
-
-## Event Reference
-
-### Common Fields (Both Functions)
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `s3_bucket` | string | — | S3 bucket containing package-lock.json |
-| `s3_key` | string | — | S3 key for package-lock.json |
-| `lockfile_content` | string | — | Raw JSON string of lockfile (alternative to S3) |
-| `setup_codeartifact` | bool | `false` | Create CodeArtifact domain/repo if they don't exist |
-| `update_existing` | bool | `false` | Scan existing CodeArtifact packages for new Chainguard versions |
-| `resume_run_id` | string | — | Resume a previous run by its run ID |
-| `list_checkpoints` | bool | `false` | List all resumable checkpoint sessions |
-| `cleanup_only` | bool | `false` | Only run garbage package cleanup |
-| `cleanup_garbage` | bool | `true` | Run cleanup before new sessions |
-| `max_packages` | int | `50000` | Max packages to process (overrides env var) |
+---
 
 ## Environment Variables
 
+### Required
+
+| Variable | Description |
+|----------|-------------|
+| `CGR_USERNAME` | Chainguard registry username |
+| `CGR_TOKEN` | Chainguard registry token |
+
+### CodeArtifact Configuration
+
 | Variable | Default | Description |
-|---|---|---|
-| `CGR_USERNAME` | *(required)* | Chainguard Libraries username |
-| `CGR_TOKEN` | *(required)* | Chainguard Libraries token |
+|----------|---------|-------------|
 | `AWS_REGION` | `us-east-2` | AWS region for all services |
 | `CODEARTIFACT_DOMAIN` | `my-npm-domain` | CodeArtifact domain name |
 | `CODEARTIFACT_REPO` | `my-npm-repo` | CodeArtifact repository name |
-| `CODEARTIFACT_UPSTREAM` | `npm-public` | Upstream repository name |
-| `ERRORS_S3_BUCKET` | — | S3 bucket for error log files |
-| `ERRORS_S3_PREFIX` | `chainguard-sync/` | S3 prefix for error logs |
-| `CHECKPOINT_S3_BUCKET` | *(falls back to ERRORS_S3_BUCKET)* | S3 bucket for checkpoint state |
-| `CHECKPOINT_S3_PREFIX` | `chainguard-sync/checkpoints/` | S3 prefix for checkpoints |
-| `CHECKPOINT_BUFFER_MS` | `120000` | Milliseconds before timeout to save checkpoint (120s) |
-| `MAX_INVOCATIONS` | `50` | Maximum self-invocations per run |
-| `MAX_PACKAGES` | `50000` | Maximum packages to process per run |
-| `LOG_LEVEL` | `DEBUG` | Logging level (DEBUG, INFO, WARNING) |
+| `CODEARTIFACT_UPSTREAM` | `npm-public` | Upstream repo with npmjs connection |
 
-> **Note:** The all-versions function uses `chainguard-sync-all/` and `chainguard-sync-all/checkpoints/` as default prefixes to keep state separate.
+### S3 & Checkpointing
 
-> **Bucket fallback chain:** The checkpoint bucket resolves in this order: `checkpoint_s3_bucket` in event → `CHECKPOINT_S3_BUCKET` env var → `errors_s3_bucket` in event → `ERRORS_S3_BUCKET` env var. At least one must be set or checkpointing will fail. The SAM template automatically wires both `CHECKPOINT_S3_BUCKET` and `ERRORS_S3_BUCKET` to the created S3 bucket.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ERRORS_S3_BUCKET` | _(none)_ | S3 bucket for `errors.txt` output |
+| `ERRORS_S3_PREFIX` | `chainguard-sync-all/` | Key prefix for error files |
+| `CHECKPOINT_S3_BUCKET` | _(falls back to ERRORS_S3_BUCKET)_ | S3 bucket for checkpoint state |
+| `CHECKPOINT_S3_PREFIX` | `chainguard-sync-all/checkpoints/` | Key prefix for checkpoints |
+| `CHECKPOINT_BUFFER_MS` | `120000` | Milliseconds before timeout to save checkpoint |
+| `MAX_INVOCATIONS` | `50` | Safety cap on self-re-invocations |
+| `MAX_PACKAGES` | `50000` | Max packages to process per run |
 
-## Response Format
+### New Feature Configuration
 
-### Successful Completion
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SNS_TOPIC_ARN` | _(none)_ | SNS topic ARN for completion/failure notifications |
+| `DRY_RUN` | `false` | Default dry-run mode (`true`/`false`) |
+| `PACKAGE_ALLOWLIST` | _(none)_ | Comma-separated glob patterns (e.g., `@types/*,lodash`) |
+| `PACKAGE_DENYLIST` | _(none)_ | Comma-separated glob patterns (e.g., `debug,colors`) |
+| `PARALLEL_DOWNLOADS` | `5` | Max concurrent tarball download threads |
+| `RETRY_MAX_ATTEMPTS` | `3` | Max retry attempts for HTTP errors |
+| `RETRY_BASE_DELAY` | `1.0` | Base delay in seconds (doubles each retry) |
+| `LOG_LEVEL` | `DEBUG` | Logging level: `DEBUG`, `INFO`, `WARN` |
+
+---
+
+## Invocation Payloads
+
+### Sync from lockfile
+```json
+{
+  "s3_bucket": "my-bucket",
+  "s3_key": "lockfiles/package-lock.json"
+}
+```
+
+### Sync with filtering and dry-run
+```json
+{
+  "s3_bucket": "my-bucket",
+  "s3_key": "lockfiles/package-lock.json",
+  "dry_run": true,
+  "allowlist": ["@types/*", "react", "react-dom"],
+  "denylist": ["debug", "colors"]
+}
+```
+
+### Update all existing CodeArtifact packages
+```json
+{
+  "update_existing": true
+}
+```
+
+### Resume a failed/timed-out run
+```json
+{
+  "resume_run_id": "20260402T034658Z-abc12345"
+}
+```
+
+### List available checkpoints
+```json
+{
+  "list_checkpoints": true
+}
+```
+
+---
+
+## Feature Details
+
+### SNS/Email Notifications
+
+The Lambda publishes to an SNS topic on every sync completion and on failures. Each message includes the full summary JSON and a `status` message attribute (`SUCCESS`, `FAILURE`) so subscribers can filter.
+
+**Setup:**
+
+1. Create an SNS topic in your AWS account.
+2. Subscribe your email address (or Slack webhook, PagerDuty, etc.) to the topic.
+3. Confirm the subscription via the email you receive.
+4. Set the `SNS_TOPIC_ARN` environment variable on the Lambda.
+
+**What you receive:**
+
+- On success: Subject like `Chainguard Sync COMPLETE — run 20260402T...` with a JSON body containing counts of synced, skipped, and failed packages.
+- On failure: Subject like `Chainguard Sync FAILED — run 20260402T...` with the error message.
+- Dry-run completions are prefixed with `[DRY-RUN]`.
+
+**Filtering by status (SQS/Lambda subscriber):**
 
 ```json
 {
-    "statusCode": 200,
-    "body": {
-        "message": "Sync complete",
-        "summary": {
-            "run_id": "20260402T034658Z-abc12345",
-            "total_invocations": 4,
-            "total_work_items": 892,
-            "synced_to_codeartifact": 845,
-            "skipped_existing": 1203,
-            "tarball_download_failed": 12,
-            "failed_to_publish": 3,
-            "http_errors": 15,
-            "errors_file": "s3://my-bucket/chainguard-sync/errors-20260402T035723Z.txt",
-            "errored_packages": ["wrappy@1.0.2", "..."],
-            "not_found_packages": ["some-private-pkg"],
-            "status": "complete"
+  "status": ["FAILURE"]
+}
+```
+
+This subscription filter policy delivers only failure notifications.
+
+---
+
+### Dry-Run Mode
+
+Dry-run executes the full discovery phase (fetching metadata from Chainguard, diffing against CodeArtifact) but skips all publishing. The response includes a sample of what *would* be synced.
+
+**Enable via event payload:**
+```json
+{ "dry_run": true, "s3_bucket": "...", "s3_key": "..." }
+```
+
+**Enable as default via environment variable:**
+```
+DRY_RUN=true
+```
+
+The event-level `dry_run` flag always takes precedence over the environment variable.
+
+**Dry-run response:**
+```json
+{
+  "statusCode": 200,
+  "body": {
+    "message": "Dry-run complete — no packages were published",
+    "summary": {
+      "run_id": "20260402T120000Z-abc12345",
+      "dry_run": true,
+      "total_work_items": 142,
+      "would_sync": 142,
+      "skipped_existing": 1803,
+      "sample_work_items": [
+        "@types/node@22.15.2",
+        "lodash@4.17.22",
+        "..."
+      ],
+      "remaining_items": 117,
+      "status": "dry_run_complete"
+    }
+  }
+}
+```
+
+---
+
+### Parallel Tarball Downloads
+
+Tarballs are downloaded in batches using a `ThreadPoolExecutor`. Each batch fetches `PARALLEL_DOWNLOADS` tarballs concurrently, then publishes them sequentially to CodeArtifact.
+
+**Configuration:**
+```
+PARALLEL_DOWNLOADS=5    # default: 5 threads
+```
+
+You can also set it higher (e.g., `10` or `15`) depending on your Lambda memory and network capacity. Each thread holds one tarball in memory, so keep memory in mind for large packages.
+
+**How it works internally:**
+
+1. Processing loop advances in batches of `PARALLEL_DOWNLOADS` items.
+2. A `ThreadPoolExecutor` downloads all tarballs in the batch concurrently.
+3. Results are collected into a dict mapping index → bytes.
+4. Each downloaded tarball is published to CodeArtifact sequentially.
+5. The loop advances to the next batch.
+
+---
+
+### Retry Logic with Exponential Backoff
+
+All HTTP operations (metadata fetch, tarball download, CodeArtifact publish) now use automatic retry with exponential backoff.
+
+**Configuration:**
+```
+RETRY_MAX_ATTEMPTS=3    # total attempts (1 = no retry)
+RETRY_BASE_DELAY=1.0    # initial delay; doubles each retry
+```
+
+**Retry schedule (defaults):**
+
+| Attempt | Delay Before |
+|---------|-------------|
+| 1st | immediate |
+| 2nd | 1.0s |
+| 3rd | 2.0s |
+
+**Retryable HTTP status codes:** `429` (rate limited), `500`, `502`, `503`, `504`.
+
+Non-retryable errors (e.g., `404`, `401`, `403`) fail immediately. Network-level errors (`URLError`, `TimeoutError`, `OSError`) are also retried.
+
+---
+
+### Package Allowlist / Denylist
+
+Filter packages by name using glob patterns. This is useful for syncing only specific scopes or excluding known-problematic packages.
+
+**Via event payload:**
+```json
+{
+  "allowlist": ["@types/*", "react", "react-dom", "@babel/*"],
+  "denylist": ["debug", "colors", "*-deprecated"]
+}
+```
+
+**Via environment variables:**
+```
+PACKAGE_ALLOWLIST=@types/*,react,react-dom
+PACKAGE_DENYLIST=debug,colors
+```
+
+**Filtering rules:**
+
+1. If an allowlist is provided, **only** packages matching at least one allowlist pattern are kept.
+2. If a denylist is provided, packages matching **any** denylist pattern are removed.
+3. The denylist is applied after the allowlist.
+4. If both are empty, all packages pass through.
+
+**Supported glob patterns:**
+
+| Pattern | Matches |
+|---------|---------|
+| `lodash` | Exact match only |
+| `@types/*` | Any package in the `@types` scope |
+| `*-loader` | Any package ending in `-loader` |
+| `@babel/*` | Any package in the `@babel` scope |
+
+The summary response includes `filtered_out` count and the patterns used.
+
+---
+
+### CloudWatch Custom Metrics
+
+After every run (including dry-runs), the Lambda publishes custom metrics to CloudWatch under the `Chainguard/NPMSync` namespace.
+
+**Metrics published:**
+
+| Metric Name | Description |
+|-------------|-------------|
+| `PackagesSynced` | Successfully published to CodeArtifact |
+| `PackagesFailed` | Failed to publish |
+| `PackagesSkipped` | Already existed in CodeArtifact |
+| `TarballDownloadFailed` | Tarball download failures |
+| `HTTPErrors` | Total HTTP errors encountered |
+
+**Dimensions:**
+
+| Dimension | Value |
+|-----------|-------|
+| `Domain` | CodeArtifact domain name |
+| `Repository` | CodeArtifact repository name |
+| `Mode` | `DryRun` (only present in dry-run mode) |
+
+**Example CloudWatch alarm (Terraform):**
+```hcl
+resource "aws_cloudwatch_metric_alarm" "sync_failures" {
+  alarm_name          = "chainguard-sync-failures"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "PackagesFailed"
+  namespace           = "Chainguard/NPMSync"
+  period              = 3600
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+
+  dimensions = {
+    Domain     = "my-npm-domain"
+    Repository = "my-npm-repo"
+  }
+}
+```
+
+---
+
+## Cron Job Setup (EventBridge Scheduler)
+
+### Console Setup
+
+1. Navigate to **Amazon EventBridge → Rules** in the AWS Console.
+2. Click **Create rule**.
+3. Enter a name like `chainguard-npm-sync-daily`.
+4. Under **Rule type**, select **Schedule**.
+5. Choose a schedule expression (see [Common Schedules](#common-schedules)).
+6. Under **Target**, select **Lambda function** and choose your function.
+7. For **Configure input**, select **Constant (JSON text)** and enter:
+   ```json
+   {
+     "s3_bucket": "my-lockfile-bucket",
+     "s3_key": "lockfiles/package-lock.json"
+   }
+   ```
+8. Click **Create**.
+
+### AWS CLI Setup
+
+**Create the EventBridge rule:**
+```bash
+aws events put-rule \
+  --name chainguard-npm-sync-daily \
+  --schedule-expression "cron(0 6 * * ? *)" \
+  --state ENABLED \
+  --description "Daily Chainguard NPM sync at 6 AM UTC"
+```
+
+**Add the Lambda as a target:**
+```bash
+aws events put-targets \
+  --rule chainguard-npm-sync-daily \
+  --targets '[{
+    "Id": "chainguard-sync-lambda",
+    "Arn": "arn:aws:lambda:us-east-2:123456789012:function:chainguard-codeartifact-sync-all",
+    "Input": "{\"s3_bucket\":\"my-lockfile-bucket\",\"s3_key\":\"lockfiles/package-lock.json\"}"
+  }]'
+```
+
+**Grant EventBridge permission to invoke the Lambda:**
+```bash
+aws lambda add-permission \
+  --function-name chainguard-codeartifact-sync-all \
+  --statement-id eventbridge-daily-sync \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn arn:aws:events:us-east-2:123456789012:rule/chainguard-npm-sync-daily
+```
+
+### Common Schedules
+
+| Schedule | Expression | Description |
+|----------|-----------|-------------|
+| Daily at 6 AM UTC | `cron(0 6 * * ? *)` | Good for most teams |
+| Every 6 hours | `rate(6 hours)` | More frequent updates |
+| Weekdays at midnight | `cron(0 0 ? * MON-FRI *)` | Business-hours alignment |
+| Weekly on Sunday | `cron(0 2 ? * SUN *)` | Low-frequency mirror |
+| Every 12 hours | `cron(0 */12 * * ? *)` | Twice-daily sync |
+
+**Tip:** Use `rate(1 hour)` with `"update_existing": true` as the input payload to continuously keep your mirror current.
+
+---
+
+## Terraform Deployment
+
+### Project Structure
+
+```
+chainguard-sync/
+├── main.tf              # Lambda, IAM, S3, CodeArtifact
+├── variables.tf         # Input variables
+├── outputs.tf           # Output values
+├── eventbridge.tf       # Cron schedule
+├── sns.tf               # Notifications
+├── cloudwatch.tf        # Alarms
+└── lambda/
+    └── lambda_function-sync-all.py
+```
+
+### Full Terraform Configuration
+
+#### `variables.tf`
+
+```hcl
+variable "aws_region" {
+  description = "AWS region for all resources"
+  type        = string
+  default     = "us-east-2"
+}
+
+variable "function_name" {
+  description = "Lambda function name"
+  type        = string
+  default     = "chainguard-codeartifact-sync-all"
+}
+
+variable "s3_bucket_name" {
+  description = "S3 bucket for lockfiles, checkpoints, and error logs"
+  type        = string
+}
+
+variable "lockfile_s3_key" {
+  description = "S3 key for the package-lock.json file"
+  type        = string
+  default     = "lockfiles/package-lock.json"
+}
+
+variable "codeartifact_domain" {
+  description = "CodeArtifact domain name"
+  type        = string
+  default     = "my-npm-domain"
+}
+
+variable "codeartifact_repo" {
+  description = "CodeArtifact repository name"
+  type        = string
+  default     = "my-npm-repo"
+}
+
+variable "codeartifact_upstream" {
+  description = "CodeArtifact upstream repo name"
+  type        = string
+  default     = "npm-public"
+}
+
+variable "cgr_username" {
+  description = "Chainguard registry username"
+  type        = string
+  sensitive   = true
+}
+
+variable "cgr_token" {
+  description = "Chainguard registry token"
+  type        = string
+  sensitive   = true
+}
+
+variable "notification_email" {
+  description = "Email address for SNS notifications (leave empty to skip)"
+  type        = string
+  default     = ""
+}
+
+variable "schedule_expression" {
+  description = "EventBridge schedule expression"
+  type        = string
+  default     = "cron(0 6 * * ? *)"
+}
+
+variable "lambda_timeout" {
+  description = "Lambda timeout in seconds (max 900)"
+  type        = number
+  default     = 900
+}
+
+variable "lambda_memory" {
+  description = "Lambda memory in MB"
+  type        = number
+  default     = 1024
+}
+
+variable "parallel_downloads" {
+  description = "Max concurrent tarball download threads"
+  type        = number
+  default     = 5
+}
+
+variable "retry_max_attempts" {
+  description = "Max retry attempts for HTTP errors"
+  type        = number
+  default     = 3
+}
+
+variable "package_allowlist" {
+  description = "Comma-separated glob patterns for package allowlist"
+  type        = string
+  default     = ""
+}
+
+variable "package_denylist" {
+  description = "Comma-separated glob patterns for package denylist"
+  type        = string
+  default     = ""
+}
+
+variable "dry_run" {
+  description = "Enable dry-run mode by default"
+  type        = bool
+  default     = false
+}
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default = {
+    Project   = "chainguard-npm-sync"
+    ManagedBy = "terraform"
+  }
+}
+```
+
+#### `main.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# ─── S3 Bucket ───────────────────────────────────────────────────────────────
+
+resource "aws_s3_bucket" "sync" {
+  bucket = var.s3_bucket_name
+  tags   = var.tags
+}
+
+resource "aws_s3_bucket_versioning" "sync" {
+  bucket = aws_s3_bucket.sync.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "sync" {
+  bucket = aws_s3_bucket.sync.id
+
+  rule {
+    id     = "expire-old-checkpoints"
+    status = "Enabled"
+
+    filter {
+      prefix = "chainguard-sync-all/checkpoints/"
+    }
+
+    expiration {
+      days = 7
+    }
+  }
+
+  rule {
+    id     = "expire-old-errors"
+    status = "Enabled"
+
+    filter {
+      prefix = "chainguard-sync-all/errors-"
+    }
+
+    expiration {
+      days = 30
+    }
+  }
+}
+
+# ─── IAM Role ────────────────────────────────────────────────────────────────
+
+data "aws_caller_identity" "current" {}
+
+resource "aws_iam_role" "lambda" {
+  name = "${var.function_name}-role"
+  tags = var.tags
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda" {
+  name = "${var.function_name}-policy"
+  role = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudWatchLogs"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*"
+      },
+      {
+        Sid    = "S3Access"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:HeadObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.sync.arn,
+          "${aws_s3_bucket.sync.arn}/*"
+        ]
+      },
+      {
+        Sid    = "CodeArtifact"
+        Effect = "Allow"
+        Action = [
+          "codeartifact:GetAuthorizationToken",
+          "codeartifact:GetRepositoryEndpoint",
+          "codeartifact:ReadFromRepository",
+          "codeartifact:PublishPackageVersion",
+          "codeartifact:PutPackageOriginConfiguration",
+          "codeartifact:ListPackages",
+          "codeartifact:ListPackageVersions",
+          "codeartifact:DeletePackageVersions",
+          "codeartifact:CreateDomain",
+          "codeartifact:CreateRepository",
+          "codeartifact:UpdateRepository",
+          "codeartifact:AssociateExternalConnection"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "StsForCodeArtifact"
+        Effect   = "Allow"
+        Action   = "sts:GetServiceBearerToken"
+        Resource = "*"
+      },
+      {
+        Sid    = "LambdaSelfInvoke"
+        Effect = "Allow"
+        Action = "lambda:InvokeFunction"
+        Resource = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${var.function_name}"
+      },
+      {
+        Sid    = "CloudWatchMetrics"
+        Effect = "Allow"
+        Action = "cloudwatch:PutMetricData"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "Chainguard/NPMSync"
+          }
         }
+      },
+      {
+        Sid    = "SNSPublish"
+        Effect = "Allow"
+        Action = "sns:Publish"
+        Resource = var.notification_email != "" ? aws_sns_topic.sync[0].arn : "*"
+      }
+    ]
+  })
+}
+
+# ─── Lambda Function ─────────────────────────────────────────────────────────
+
+data "archive_file" "lambda" {
+  type        = "zip"
+  source_file = "${path.module}/lambda/lambda_function-sync-all.py"
+  output_path = "${path.module}/.build/lambda.zip"
+}
+
+resource "aws_lambda_function" "sync" {
+  function_name    = var.function_name
+  role             = aws_iam_role.lambda.arn
+  handler          = "lambda_function-sync-all.lambda_handler"
+  runtime          = "python3.12"
+  timeout          = var.lambda_timeout
+  memory_size      = var.lambda_memory
+  filename         = data.archive_file.lambda.output_path
+  source_code_hash = data.archive_file.lambda.output_base64sha256
+  tags             = var.tags
+
+  environment {
+    variables = {
+      CGR_USERNAME       = var.cgr_username
+      CGR_TOKEN          = var.cgr_token
+      AWS_REGION_OVERRIDE = var.aws_region
+      CODEARTIFACT_DOMAIN = var.codeartifact_domain
+      CODEARTIFACT_REPO   = var.codeartifact_repo
+      CODEARTIFACT_UPSTREAM = var.codeartifact_upstream
+      ERRORS_S3_BUCKET    = aws_s3_bucket.sync.id
+      CHECKPOINT_S3_BUCKET = aws_s3_bucket.sync.id
+      SNS_TOPIC_ARN       = var.notification_email != "" ? aws_sns_topic.sync[0].arn : ""
+      DRY_RUN             = var.dry_run ? "true" : "false"
+      PACKAGE_ALLOWLIST   = var.package_allowlist
+      PACKAGE_DENYLIST    = var.package_denylist
+      PARALLEL_DOWNLOADS  = tostring(var.parallel_downloads)
+      RETRY_MAX_ATTEMPTS  = tostring(var.retry_max_attempts)
+      LOG_LEVEL           = "INFO"
     }
+  }
+}
+
+resource "aws_cloudwatch_log_group" "lambda" {
+  name              = "/aws/lambda/${var.function_name}"
+  retention_in_days = 14
+  tags              = var.tags
 }
 ```
 
-### Checkpoint Continuation — Discovery Phase
+#### `sns.tf`
 
-```json
-{
-    "statusCode": 200,
-    "body": {
-        "message": "Discovery checkpointed at package 800/2519 — continuation #2 launched",
-        "summary": {
-            "run_id": "20260402T034658Z-abc12345",
-            "invocation_number": 1,
-            "phase": "discovery",
-            "discovery_progress": "800/2519",
-            "work_items_so_far": 234,
-            "status": "continuing",
-            "found": 0,
-            "not_found": 0,
-            "failed": 0,
-            "skipped_existing": 1580
+```hcl
+resource "aws_sns_topic" "sync" {
+  count = var.notification_email != "" ? 1 : 0
+  name  = "${var.function_name}-notifications"
+  tags  = var.tags
+}
+
+resource "aws_sns_topic_subscription" "email" {
+  count     = var.notification_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.sync[0].arn
+  protocol  = "email"
+  endpoint  = var.notification_email
+}
+```
+
+#### `eventbridge.tf`
+
+```hcl
+resource "aws_cloudwatch_event_rule" "sync_schedule" {
+  name                = "${var.function_name}-schedule"
+  description         = "Scheduled trigger for Chainguard NPM sync"
+  schedule_expression = var.schedule_expression
+  tags                = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "sync_lambda" {
+  rule      = aws_cloudwatch_event_rule.sync_schedule.name
+  target_id = "chainguard-sync"
+  arn       = aws_lambda_function.sync.arn
+
+  input = jsonencode({
+    s3_bucket = aws_s3_bucket.sync.id
+    s3_key    = var.lockfile_s3_key
+  })
+}
+
+resource "aws_lambda_permission" "eventbridge" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.sync.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.sync_schedule.arn
+}
+```
+
+#### `cloudwatch.tf`
+
+```hcl
+resource "aws_cloudwatch_metric_alarm" "sync_failures" {
+  alarm_name          = "${var.function_name}-failures"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "PackagesFailed"
+  namespace           = "Chainguard/NPMSync"
+  period              = 3600
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "Alert when Chainguard sync has package publish failures"
+  alarm_actions       = var.notification_email != "" ? [aws_sns_topic.sync[0].arn] : []
+  tags                = var.tags
+
+  dimensions = {
+    Domain     = var.codeartifact_domain
+    Repository = var.codeartifact_repo
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  alarm_name          = "${var.function_name}-lambda-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 3600
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "Alert when the Lambda function itself errors"
+  alarm_actions       = var.notification_email != "" ? [aws_sns_topic.sync[0].arn] : []
+  tags                = var.tags
+
+  dimensions = {
+    FunctionName = aws_lambda_function.sync.function_name
+  }
+}
+
+resource "aws_cloudwatch_dashboard" "sync" {
+  dashboard_name = "${var.function_name}-dashboard"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Packages Synced vs Failed"
+          metrics = [
+            ["Chainguard/NPMSync", "PackagesSynced", "Domain", var.codeartifact_domain, "Repository", var.codeartifact_repo],
+            [".", "PackagesFailed", ".", ".", ".", "."],
+            [".", "TarballDownloadFailed", ".", ".", ".", "."]
+          ]
+          period = 86400
+          stat   = "Sum"
+          region = var.aws_region
+          view   = "timeSeries"
         }
-    }
-}
-```
-
-### Checkpoint Continuation — Processing Phase
-
-```json
-{
-    "statusCode": 200,
-    "body": {
-        "message": "Checkpointed at 400/892 — continuation #5 launched",
-        "summary": {
-            "run_id": "20260402T034658Z-abc12345",
-            "invocation_number": 4,
-            "phase": "processing",
-            "processed_so_far": 400,
-            "total_work_items": 892,
-            "status": "continuing",
-            "found": 380,
-            "not_found": 15,
-            "failed": 5,
-            "http_errors": 20
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Lambda Duration & Invocations"
+          metrics = [
+            ["AWS/Lambda", "Duration", "FunctionName", var.function_name],
+            [".", "Invocations", ".", "."],
+            [".", "Errors", ".", "."]
+          ]
+          period = 86400
+          stat   = "Sum"
+          region = var.aws_region
+          view   = "timeSeries"
         }
-    }
+      }
+    ]
+  })
 }
 ```
 
-### Error with Resume Info
+#### `outputs.tf`
 
-```json
-{
-    "statusCode": 400,
-    "body": {
-        "error": "Exceeded max invocations (50). Resume with: {\"resume_run_id\": \"20260402T034658Z-abc12345\"}"
-    }
+```hcl
+output "lambda_function_arn" {
+  description = "ARN of the sync Lambda function"
+  value       = aws_lambda_function.sync.arn
+}
+
+output "lambda_function_name" {
+  description = "Name of the sync Lambda function"
+  value       = aws_lambda_function.sync.function_name
+}
+
+output "s3_bucket_name" {
+  description = "S3 bucket for lockfiles, checkpoints, and errors"
+  value       = aws_s3_bucket.sync.id
+}
+
+output "sns_topic_arn" {
+  description = "SNS topic ARN for notifications"
+  value       = var.notification_email != "" ? aws_sns_topic.sync[0].arn : "N/A (no email configured)"
+}
+
+output "cloudwatch_dashboard_url" {
+  description = "URL for the CloudWatch dashboard"
+  value       = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${aws_cloudwatch_dashboard.sync.dashboard_name}"
+}
+
+output "eventbridge_rule_arn" {
+  description = "ARN of the EventBridge schedule rule"
+  value       = aws_cloudwatch_event_rule.sync_schedule.arn
 }
 ```
 
-## Error Handling
+### Deploying
 
-Errors are handled at three levels:
+```bash
+# Initialize Terraform
+terraform init
 
-### Per-Package Errors (Non-Fatal)
+# Preview changes
+terraform plan \
+  -var="s3_bucket_name=my-chainguard-sync" \
+  -var="cgr_username=your-cgr-user" \
+  -var="cgr_token=your-cgr-token" \
+  -var="notification_email=team@example.com"
 
-HTTP/HTTPS errors during metadata fetch, tarball download, or publishing are caught per-package and recorded to an `ErrorTracker`. Processing always continues to the next package.
+# Apply
+terraform apply \
+  -var="s3_bucket_name=my-chainguard-sync" \
+  -var="cgr_username=your-cgr-user" \
+  -var="cgr_token=your-cgr-token" \
+  -var="notification_email=team@example.com"
 
-### Error Log Files
+# Upload your lockfile
+aws s3 cp package-lock.json s3://my-chainguard-sync/lockfiles/package-lock.json
 
-An `errors.txt` file is written to S3 at **every** exit point — not just clean completion. This includes timeouts, MAX_INVOCATIONS limits, and unexpected crashes.
-
-```
-# Chainguard -> CodeArtifact sync errors
-# Generated: 2026-04-02T03:57:23Z
-# Total errors: 3
-
-wrappy@1.0.2  |  phase=fetch_tarball  |  HTTP 500  |  HTTPError  |  Internal Server Error
-@types/node@22.15.10  |  phase=publish  |  HTTP 400  |  HTTPError  |  Bad Request — ...
-```
-
-### Failure Checkpoints (Crash Recovery)
-
-If an unexpected exception crashes the function mid-run, a checkpoint is automatically saved before the error is returned. The error message includes the resume command:
-
-```
-Unexpected error at item 142/500: MemoryError: ...
-Resume with: {"resume_run_id": "20260402T034658Z-abc12345"}
-```
-
-## Scheduling with EventBridge
-
-To keep your CodeArtifact mirror current automatically:
-
-```yaml
-# Add to template.yaml Resources section
-UpdateSchedule:
-    Type: AWS::Events::Rule
-    Properties:
-        ScheduleExpression: 'cron(0 2 * * ? *)'  # Daily at 2am UTC
-        Targets:
-            - Arn: !GetAtt SyncFunction.Arn
-              Id: DailyUpdateCheck
-              Input: '{"update_existing": true}'
-
-UpdateSchedulePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-        FunctionName: !Ref SyncFunction
-        Action: lambda:InvokeFunction
-        Principal: events.amazonaws.com
-        SourceArn: !GetAtt UpdateSchedule.Arn
+# Test with a dry-run
+aws lambda invoke \
+  --function-name chainguard-codeartifact-sync-all \
+  --payload '{"s3_bucket":"my-chainguard-sync","s3_key":"lockfiles/package-lock.json","dry_run":true}' \
+  --cli-binary-format raw-in-base64-out \
+  response.json && cat response.json | jq .
 ```
 
-## IAM Permissions
+### Variables Reference
 
-Both functions require these permissions (automatically configured by the SAM template):
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `s3_bucket_name` | Yes | — | S3 bucket name |
+| `cgr_username` | Yes | — | Chainguard username |
+| `cgr_token` | Yes | — | Chainguard token |
+| `notification_email` | No | `""` | Email for alerts |
+| `schedule_expression` | No | `cron(0 6 * * ? *)` | EventBridge schedule |
+| `lambda_timeout` | No | `900` | Timeout in seconds |
+| `lambda_memory` | No | `1024` | Memory in MB |
+| `parallel_downloads` | No | `5` | Download threads |
+| `package_allowlist` | No | `""` | Comma-separated globs |
+| `package_denylist` | No | `""` | Comma-separated globs |
+| `dry_run` | No | `false` | Default dry-run mode |
 
-| Service | Actions | Purpose |
-|---|---|---|
-| CodeArtifact | `CreateDomain`, `CreateRepository`, `UpdateRepository`, `AssociateExternalConnection` | First-time setup |
-| CodeArtifact | `GetAuthorizationToken`, `GetRepositoryEndpoint` | Authentication |
-| CodeArtifact | `PutPackageOriginConfiguration` | Block upstream for published packages |
-| CodeArtifact | `PublishPackageVersion` | Publish tarballs |
-| CodeArtifact | `ListPackageVersions`, `ListPackages` | Discovery and version diffing |
-| CodeArtifact | `DeletePackageVersions` | Garbage cleanup |
-| STS | `GetServiceBearerToken` | CodeArtifact auth token |
-| S3 | `GetObject`, `PutObject`, `DeleteObject` | Lockfiles, checkpoints, errors |
-| S3 | `ListBucket` | List checkpoint files |
-| Lambda | `InvokeFunction` | Self-invoke for continuation |
+### Outputs Reference
 
-## Scaling
+| Output | Description |
+|--------|-------------|
+| `lambda_function_arn` | Lambda ARN for cross-account invocations |
+| `lambda_function_name` | Function name for CLI invocations |
+| `s3_bucket_name` | Bucket name for uploading lockfiles |
+| `sns_topic_arn` | SNS topic for adding more subscribers |
+| `cloudwatch_dashboard_url` | Direct link to the monitoring dashboard |
+| `eventbridge_rule_arn` | Schedule rule ARN |
 
-| Config | Default | Effect |
-|---|---|---|
-| `MAX_PACKAGES` | 50,000 | Packages processed per run. Increase for larger monorepos. |
-| `MAX_INVOCATIONS` | 50 | Max chained invocations. At ~13 min each = ~10.8 hours max. |
-| `CHECKPOINT_BUFFER_MS` | 120,000 | Time reserved for checkpoint save (2 min). Increase if saves are slow. |
-| `MemorySize` | 1024 MB | Lambda memory. Increase if processing large tarballs. |
+---
 
-For a lockfile with 50,000 packages where each metadata fetch + version check takes ~200ms, discovery alone needs ~2.7 hours (about 12 invocations). Processing speed depends on tarball sizes but typically handles 200-400 packages per invocation.
+## Monitoring & Alerting
 
-## File Structure
+Once deployed, you get three layers of observability:
 
-```
-├── lambda_function.py      # Lockfile-versions-only sync
-├── sync_all_versions.py    # All-versions sync
-├── template.yaml           # SAM deployment template
-└── README.md               # This file
-```
+**CloudWatch Logs** — Every Lambda invocation logs to `/aws/lambda/chainguard-codeartifact-sync-all` with structured messages showing discovery progress, per-package actions, and timing.
+
+**CloudWatch Custom Metrics** — Under the `Chainguard/NPMSync` namespace, you can build dashboards and alarms on `PackagesSynced`, `PackagesFailed`, `PackagesSkipped`, `TarballDownloadFailed`, and `HTTPErrors`.
+
+**SNS Notifications** — Every completion/failure sends a JSON summary to your SNS topic. Use subscription filter policies to route failures to PagerDuty and successes to a Slack channel.
+
+**Recommended alarms:**
+
+- `PackagesFailed > 0` — Something failed to publish; investigate errors.txt in S3.
+- `HTTPErrors > 10` — Chainguard or CodeArtifact may be having issues.
+- `Lambda Errors > 0` — The function itself crashed (OOM, timeout without checkpoint, etc.).
+
+---
 
 ## Troubleshooting
 
-### "Invalid bucket name" or "Parameter validation failed" errors
+**"Exceeded max invocations" error** — The sync needed more than 50 Lambda invocations. Increase `MAX_INVOCATIONS` or use `resume_run_id` to continue.
 
-The checkpoint S3 bucket resolved to an empty string. This happens when none of the four bucket sources are configured: `checkpoint_s3_bucket` in event, `CHECKPOINT_S3_BUCKET` env var, `errors_s3_bucket` in event, or `ERRORS_S3_BUCKET` env var.
+**"No S3 bucket for checkpoints" error** — Set `CHECKPOINT_S3_BUCKET` or `ERRORS_S3_BUCKET` environment variable.
 
-**Fix:** If using the SAM template, both `CHECKPOINT_S3_BUCKET` and `ERRORS_S3_BUCKET` are automatically set to the created bucket. If deploying manually, set at least `ERRORS_S3_BUCKET`:
+**Slow syncs** — Increase `PARALLEL_DOWNLOADS` (try `10` or `15`) and ensure Lambda memory is at least 1024 MB.
 
-```bash
-aws lambda update-function-configuration \
-    --function-name chainguard-codeartifact-sync \
-    --environment "Variables={ERRORS_S3_BUCKET=my-bucket,...}"
-```
+**Rate limiting (HTTP 429)** — The retry logic handles this automatically. If persistent, reduce `PARALLEL_DOWNLOADS` or increase `RETRY_BASE_DELAY`.
 
-### Lambda times out during discovery phase
+**Packages not appearing** — Check that they're not being filtered by your allowlist/denylist. Run a dry-run to see what would sync.
 
-For lockfiles with thousands of packages, the discovery phase (metadata fetch + version diff per package) can exceed 15 minutes. The function now checkpoints during discovery — check CloudWatch for messages like:
-
-```
-Discovery checkpointed at package 800/2519 — continuation #2 launched
-```
-
-If discovery is too slow, the function automatically chains across multiple invocations. With `MAX_INVOCATIONS=50`, discovery can run for ~10 hours. If it still hits the cap, resume manually:
-
-```bash
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --invocation-type Event \
-    --payload '{"resume_run_id": "<run_id from error message>"}' response.json
-```
-
-### Lambda times out at 15 minutes
-
-This is expected for large lockfiles. Both discovery and processing phases checkpoint automatically and self-invoke. Check CloudWatch for continuation logs showing `phase=discovery` or `phase=processing`. If it hits `MAX_INVOCATIONS`, increase the limit or resume manually with `{"resume_run_id": "..."}`. The checkpoint is preserved so no work is lost.
-
-### "Missing x-amz-content-sha256" errors
-
-The auth-stripping redirect handler should prevent this. If you see it, ensure you're running the latest code — the `_StripAuthOnRedirectHandler` class strips the `Authorization` header before following redirects to presigned S3/R2 URLs.
-
-### "tarball attachment is missing from the request"
-
-The npm PUT payload requires specific naming conventions. The current code uses `{name}-{version}.tgz` for the `_attachments` key (e.g., `@types/node-16.11.43.tgz`). If you see this error, check that the publish function matches this format.
-
-### Packages with `node_modules` in their name
-
-These are artifacts from a previous lockfile parser bug. Run `{"cleanup_only": true}` to remove them, or rely on the automatic cleanup that runs before every new session.
-
-### CLI timeout: "Read timeout on endpoint URL"
-
-The AWS CLI has a 60-second default timeout. Use `--cli-read-timeout 900` for synchronous invocations, or `--invocation-type Event` for async fire-and-forget.
-
-### Botocore debug noise in CloudWatch
-
-Both functions suppress `botocore`, `boto3`, and `urllib3` loggers at WARNING level. If you see raw HTTP signatures and certificate paths, redeploy to pick up the latest code.
-
-### "Invalid base64" or "Invalid JSON" payload errors
-
-AWS CLI v2 defaults to base64-encoding the `--payload` parameter. If you see errors like `Invalid base64`, `Could not parse request body`, or the Lambda receives garbled input, add the `--cli-binary-format raw-in-base64-out` flag to every `aws lambda invoke` command:
-
-```bash
-aws lambda invoke \
-    --function-name chainguard-codeartifact-sync \
-    --cli-binary-format raw-in-base64-out \
-    --payload '{"s3_bucket": "my-bucket", "s3_key": "package-lock.json"}' \
-    response.json
-```
-
-This tells the CLI to send the payload as raw JSON instead of base64-encoding it. All examples in this README include this flag.
-
-To set this globally so you don't need to pass it every time, add it to your AWS CLI config:
-
-```ini
-# ~/.aws/config
-[default]
-cli_binary_format = raw-in-base64-out
-```
-
-> **Note:** AWS CLI v1 sends raw payloads by default and does not need this flag.
-
-## License and Support
-
-Internal use. Chainguard Libraries access requires a valid Chainguard subscription. This function is presented as is and is not officially supported by Chainguard. 
+**SNS notifications not arriving** — Confirm the subscription in your email, and verify `SNS_TOPIC_ARN` is set correctly. Check the Lambda logs for "Failed to send SNS notification" errors.

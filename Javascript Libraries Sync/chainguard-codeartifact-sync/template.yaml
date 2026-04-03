@@ -5,7 +5,11 @@ Description: >
   Reads a package-lock.json (from S3 or inline), fetches tarballs from
   Chainguard Libraries, and publishes them to CodeArtifact.
 
+# ====================================================================
+# Parameters
+# ====================================================================
 Parameters:
+  # --- Chainguard credentials ---
   CgrUsername:
     Type: String
     Description: Chainguard registry username
@@ -13,6 +17,8 @@ Parameters:
     Type: String
     Description: Chainguard registry token
     NoEcho: true
+
+  # --- CodeArtifact ---
   CodeArtifactDomain:
     Type: String
     Default: my-npm-domain
@@ -22,6 +28,8 @@ Parameters:
   CodeArtifactUpstream:
     Type: String
     Default: npm-public
+
+  # --- Safety limits ---
   MaxInvocations:
     Type: Number
     Description: Safety cap on self-re-invocations
@@ -31,6 +39,92 @@ Parameters:
     Description: Maximum number of packages to process per run
     Default: 50000
 
+  # --- Retry & parallelism ---
+  MaxRetries:
+    Type: Number
+    Description: Max retry attempts for transient HTTP errors (429, 5xx)
+    Default: 3
+  RetryBaseDelay:
+    Type: String
+    Description: Base delay in seconds for exponential backoff
+    Default: '1.0'
+  ParallelDownloads:
+    Type: Number
+    Description: Max concurrent tarball downloads per batch
+    Default: 5
+
+  # --- Package filtering ---
+  Allowlist:
+    Type: String
+    Description: >-
+      JSON array of package glob patterns to include
+      (e.g. '["@mycompany/*", "lodash"]'). Leave empty to include all.
+    Default: ''
+  Denylist:
+    Type: String
+    Description: >-
+      JSON array of package glob patterns to exclude
+      (e.g. '["deprecated-*"]'). Leave empty to exclude nothing.
+    Default: ''
+
+  # --- SNS notifications ---
+  SnsNotificationEmail:
+    Type: String
+    Description: >-
+      Email address for sync completion/failure notifications.
+      Leave empty to disable SNS notifications.
+    Default: ''
+
+  # --- CloudWatch metrics ---
+  CwMetricsEnabled:
+    Type: String
+    Description: Enable CloudWatch custom metrics (true/false)
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  CwMetricsNamespace:
+    Type: String
+    Description: CloudWatch namespace for custom metrics
+    Default: ChainguardSync
+
+  # --- Scheduled execution ---
+  SyncScheduleExpression:
+    Type: String
+    Description: >-
+      EventBridge schedule for lockfile sync (e.g. 'cron(0 2 * * ? *)').
+      Leave empty to disable scheduled sync.
+    Default: ''
+  SyncSchedulePayload:
+    Type: String
+    Description: >-
+      JSON event payload for scheduled lockfile sync.
+      Must include s3_bucket and s3_key.
+    Default: ''
+  UpdateScheduleExpression:
+    Type: String
+    Description: >-
+      EventBridge schedule for update-existing mode (e.g. 'rate(6 hours)').
+      Leave empty to disable.
+    Default: ''
+
+  # --- Logging ---
+  LogLevel:
+    Type: String
+    Description: Lambda log level
+    Default: DEBUG
+    AllowedValues: [DEBUG, INFO, WARN]
+
+# ====================================================================
+# Conditions
+# ====================================================================
+Conditions:
+  HasSnsEmail: !Not [!Equals [!Ref SnsNotificationEmail, '']]
+  HasSyncSchedule: !Not [!Equals [!Ref SyncScheduleExpression, '']]
+  HasUpdateSchedule: !Not [!Equals [!Ref UpdateScheduleExpression, '']]
+  HasCwMetrics: !Equals [!Ref CwMetricsEnabled, 'true']
+
+# ====================================================================
+# Resources
+# ====================================================================
 Resources:
   # ------------------------------------------------------------------
   # S3 bucket for errors, checkpoints, and lockfile uploads
@@ -70,6 +164,23 @@ Resources:
               SSEAlgorithm: AES256
 
   # ------------------------------------------------------------------
+  # SNS topic for notifications (created only if email is provided)
+  # ------------------------------------------------------------------
+  SyncNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasSnsEmail
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-sync-notifications'
+
+  SyncNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasSnsEmail
+    Properties:
+      TopicArn: !Ref SyncNotificationTopic
+      Protocol: email
+      Endpoint: !Ref SnsNotificationEmail
+
+  # ------------------------------------------------------------------
   # Lambda: Sync lockfile versions only
   # ------------------------------------------------------------------
   SyncFunction:
@@ -82,6 +193,7 @@ Resources:
       MemorySize: 1024
       Architectures:
         - arm64
+      ReservedConcurrentExecutions: 1
       Environment:
         Variables:
           CGR_USERNAME: !Ref CgrUsername
@@ -96,10 +208,26 @@ Resources:
           CHECKPOINT_BUFFER_MS: '120000'
           MAX_INVOCATIONS: !Ref MaxInvocations
           MAX_PACKAGES: !Ref MaxPackages
-          LOG_LEVEL: DEBUG
+          LOG_LEVEL: !Ref LogLevel
+          # Retry & parallelism
+          MAX_RETRIES: !Ref MaxRetries
+          RETRY_BASE_DELAY: !Ref RetryBaseDelay
+          PARALLEL_DOWNLOADS: !Ref ParallelDownloads
+          # Package filtering
+          ALLOWLIST: !Ref Allowlist
+          DENYLIST: !Ref Denylist
+          # SNS notifications (empty string disables)
+          SNS_TOPIC_ARN: !If
+            - HasSnsEmail
+            - !Ref SyncNotificationTopic
+            - ''
+          # CloudWatch custom metrics
+          CW_METRICS_ENABLED: !Ref CwMetricsEnabled
+          CW_METRICS_NAMESPACE: !Ref CwMetricsNamespace
       Policies:
         - Version: '2012-10-17'
           Statement:
+            # CodeArtifact permissions
             - Effect: Allow
               Action:
                 - codeartifact:CreateDomain
@@ -114,10 +242,12 @@ Resources:
                 - codeartifact:ListPackages
                 - codeartifact:DeletePackageVersions
               Resource: '*'
+            # STS for CodeArtifact auth token
             - Effect: Allow
               Action:
                 - sts:GetServiceBearerToken
               Resource: '*'
+            # S3 — scoped to the sync bucket
             - Effect: Allow
               Action:
                 - s3:GetObject
@@ -128,13 +258,111 @@ Resources:
               Action:
                 - s3:ListBucket
               Resource: !GetAtt SyncBucket.Arn
+            # Self-invoke for checkpoint continuation
             - Effect: Allow
               Action:
                 - lambda:InvokeFunction
               Resource: !GetAtt SyncFunction.Arn
+            # CloudWatch custom metrics
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+            # SNS publish (conditional — only when topic exists)
+            - !If
+              - HasSnsEmail
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SyncNotificationTopic
+              - !Ref 'AWS::NoValue'
+
+  SyncFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SyncFunction}'
+      RetentionInDays: 14
 
   # ------------------------------------------------------------------
-  # Lambda: Sync ALL Chainguard versions
+  # EventBridge: Scheduled lockfile sync (optional)
+  # ------------------------------------------------------------------
+  SyncScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: HasSyncSchedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-sync-schedule'
+      Description: Scheduled Chainguard NPM lockfile sync
+      ScheduleExpression: !Ref SyncScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: SyncFunctionTarget
+          Arn: !GetAtt SyncFunction.Arn
+          Input: !Ref SyncSchedulePayload
+
+  SyncSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasSyncSchedule
+    Properties:
+      FunctionName: !Ref SyncFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SyncScheduleRule.Arn
+
+  # ------------------------------------------------------------------
+  # EventBridge: Scheduled update-existing check (optional)
+  # ------------------------------------------------------------------
+  UpdateScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: HasUpdateSchedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-update-schedule'
+      Description: Check for new Chainguard versions of existing CodeArtifact packages
+      ScheduleExpression: !Ref UpdateScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: SyncFunctionUpdateTarget
+          Arn: !GetAtt SyncFunction.Arn
+          Input: '{"update_existing": true}'
+
+  UpdateSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasUpdateSchedule
+    Properties:
+      FunctionName: !Ref SyncFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UpdateScheduleRule.Arn
+
+  # ------------------------------------------------------------------
+  # CloudWatch alarm: high failure rate (optional)
+  # ------------------------------------------------------------------
+  HighFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasCwMetrics
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-failure-rate'
+      AlarmDescription: >-
+        Fires when more than 10 packages fail to sync in an hour.
+      Namespace: !Ref CwMetricsNamespace
+      MetricName: PackagesFailed
+      Dimensions:
+        - Name: Domain
+          Value: !Ref CodeArtifactDomain
+        - Name: Repository
+          Value: !Ref CodeArtifactRepo
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasSnsEmail
+        - - !Ref SyncNotificationTopic
+        - []
+
+  # ------------------------------------------------------------------
+  # Lambda: Sync ALL Chainguard versions (unchanged)
   # ------------------------------------------------------------------
   SyncAllVersionsFunction:
     Type: AWS::Serverless::Function
@@ -160,7 +388,7 @@ Resources:
           CHECKPOINT_BUFFER_MS: '120000'
           MAX_INVOCATIONS: !Ref MaxInvocations
           MAX_PACKAGES: !Ref MaxPackages
-          LOG_LEVEL: DEBUG
+          LOG_LEVEL: !Ref LogLevel
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -197,19 +425,44 @@ Resources:
                 - lambda:InvokeFunction
               Resource: !GetAtt SyncAllVersionsFunction.Arn
 
+# ====================================================================
+# Outputs
+# ====================================================================
 Outputs:
   SyncFunctionArn:
     Description: Lockfile-versions-only sync function
     Value: !GetAtt SyncFunction.Arn
   SyncFunctionName:
     Value: !Ref SyncFunction
+
   SyncAllVersionsFunctionArn:
     Description: All-versions sync function
     Value: !GetAtt SyncAllVersionsFunction.Arn
   SyncAllVersionsFunctionName:
     Value: !Ref SyncAllVersionsFunction
+
   SyncBucketName:
     Description: S3 bucket for errors, checkpoints, and lockfile uploads
     Value: !Ref SyncBucket
   SyncBucketArn:
     Value: !GetAtt SyncBucket.Arn
+
+  SnsTopicArn:
+    Condition: HasSnsEmail
+    Description: SNS topic for sync notifications
+    Value: !Ref SyncNotificationTopic
+
+  SyncScheduleRuleName:
+    Condition: HasSyncSchedule
+    Description: EventBridge rule for scheduled lockfile sync
+    Value: !Ref SyncScheduleRule
+
+  UpdateScheduleRuleName:
+    Condition: HasUpdateSchedule
+    Description: EventBridge rule for scheduled update-existing checks
+    Value: !Ref UpdateScheduleRule
+
+  HighFailureRateAlarmName:
+    Condition: HasCwMetrics
+    Description: CloudWatch alarm for high package failure rate
+    Value: !Ref HighFailureRateAlarm

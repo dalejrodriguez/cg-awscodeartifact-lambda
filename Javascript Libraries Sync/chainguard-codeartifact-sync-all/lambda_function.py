@@ -5,13 +5,16 @@ For each unique package name in the lockfile, fetches ALL versions
 available in Chainguard Libraries, diffs against CodeArtifact, and
 publishes only new versions. Use this to fully populate your
 CodeArtifact mirror. For syncing only the exact lockfile versions,
-use the companion lambda: lambda_function.py
+use the companion lambda: chainguard-codeartifact-sync
 
 Trigger:
 {
     "s3_bucket": "my-bucket",
     "s3_key": "path/to/package-lock.json",
-    "setup_codeartifact": false         // optional, default false
+    "setup_codeartifact": false,        // optional, default false
+    "dry_run": false,                   // optional, preview without syncing
+    "allowlist": ["lodash", "@types/*"],// optional, glob patterns
+    "denylist": ["debug", "colors"]     // optional, glob patterns
 }
 
 Resume a previous run:
@@ -35,6 +38,13 @@ Environment variables:
     MAX_INVOCATIONS         — safety cap on re-invocations   (default: 50)
     MAX_PACKAGES            — max packages to process per run (default: 50000)
     LOG_LEVEL               — DEBUG / INFO / WARN  (default: DEBUG)
+    SNS_TOPIC_ARN           — SNS topic for notifications    (optional)
+    DRY_RUN                 — default dry-run mode           (default: false)
+    PACKAGE_ALLOWLIST       — comma-separated glob patterns  (optional)
+    PACKAGE_DENYLIST        — comma-separated glob patterns  (optional)
+    PARALLEL_DOWNLOADS      — max concurrent tarball threads (default: 5)
+    RETRY_MAX_ATTEMPTS      — max retry attempts for HTTP    (default: 3)
+    RETRY_BASE_DELAY        — base delay in seconds          (default: 1.0)
 """
 
 import json
@@ -45,6 +55,9 @@ import logging
 import urllib.request
 import urllib.error
 import urllib.parse
+import time
+import fnmatch
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import boto3
@@ -67,9 +80,6 @@ logging.getLogger().setLevel(getattr(logging, LOG_LEVEL, logging.DEBUG))
 logger = logging.getLogger(__name__)
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.DEBUG))
 
-# Suppress botocore/boto3 raw HTTP debug logs — they flood CloudWatch with
-# SigV4 signatures, full request/response bodies, and certificate paths.
-# Our module logger stays at DEBUG for useful application-level logs.
 logging.getLogger("botocore").setLevel(logging.WARNING)
 logging.getLogger("boto3").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -88,7 +98,148 @@ MAX_INVOCATIONS = int(os.environ.get("MAX_INVOCATIONS", "50"))
 MAX_PACKAGES = int(os.environ.get("MAX_PACKAGES", "50000"))
 FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "chainguard-codeartifact-sync-all")
 
+# --- New feature configuration ---
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+DRY_RUN_DEFAULT = os.environ.get("DRY_RUN", "false").lower() in ("true", "1", "yes")
+PACKAGE_ALLOWLIST = [p.strip() for p in os.environ.get("PACKAGE_ALLOWLIST", "").split(",") if p.strip()]
+PACKAGE_DENYLIST = [p.strip() for p in os.environ.get("PACKAGE_DENYLIST", "").split(",") if p.strip()]
+PARALLEL_DOWNLOADS = int(os.environ.get("PARALLEL_DOWNLOADS", "5"))
+RETRY_MAX_ATTEMPTS = int(os.environ.get("RETRY_MAX_ATTEMPTS", "3"))
+RETRY_BASE_DELAY = float(os.environ.get("RETRY_BASE_DELAY", "1.0"))
+
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+sns_client = boto3.client("sns", region_name=AWS_REGION) if SNS_TOPIC_ARN else None
+cw_client = boto3.client("cloudwatch", region_name=AWS_REGION)
+
+
+# ===================================================================
+# SNS Notifications
+# ===================================================================
+def _send_notification(subject: str, message: str, status: str = "INFO"):
+    """Publish a notification to the configured SNS topic."""
+    if not SNS_TOPIC_ARN:
+        logger.debug("SNS_TOPIC_ARN not set — skipping notification")
+        return
+    try:
+        client = sns_client or boto3.client("sns", region_name=AWS_REGION)
+        client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject[:100],
+            Message=message,
+            MessageAttributes={
+                "status": {"DataType": "String", "StringValue": status},
+            },
+        )
+        logger.info("SNS notification sent: %s [%s]", subject[:80], status)
+    except Exception as exc:
+        logger.error("Failed to send SNS notification: %s", exc)
+
+
+def _notify_completion(summary: dict, dry_run: bool = False):
+    prefix = "[DRY-RUN] " if dry_run else ""
+    status = summary.get("status", "complete")
+    failed = summary.get("failed_to_publish", 0) + summary.get("tarball_download_failed", 0)
+    sns_status = "FAILURE" if failed > 0 else "SUCCESS"
+    subject = f"{prefix}Chainguard Sync {status.upper()} — run {summary.get('run_id', 'unknown')}"
+    _send_notification(subject, json.dumps(summary, indent=2, default=str), sns_status)
+
+
+def _notify_failure(message: str, run_id: str = "unknown"):
+    _send_notification(f"Chainguard Sync FAILED — run {run_id}", message, "FAILURE")
+
+
+# ===================================================================
+# CloudWatch Custom Metrics
+# ===================================================================
+def _put_metrics(summary: dict, dry_run: bool = False):
+    """Publish custom CloudWatch metrics under Chainguard/NPMSync namespace."""
+    namespace = "Chainguard/NPMSync"
+    dimensions = [
+        {"Name": "Domain", "Value": DOMAIN_NAME},
+        {"Name": "Repository", "Value": REPO_NAME},
+    ]
+    if dry_run:
+        dimensions.append({"Name": "Mode", "Value": "DryRun"})
+
+    metric_data = [
+        {"MetricName": "PackagesSynced", "Value": summary.get("synced_to_codeartifact", 0),
+         "Unit": "Count", "Dimensions": dimensions},
+        {"MetricName": "PackagesFailed", "Value": summary.get("failed_to_publish", 0),
+         "Unit": "Count", "Dimensions": dimensions},
+        {"MetricName": "PackagesSkipped", "Value": summary.get("skipped_existing", 0),
+         "Unit": "Count", "Dimensions": dimensions},
+        {"MetricName": "TarballDownloadFailed", "Value": summary.get("tarball_download_failed", 0),
+         "Unit": "Count", "Dimensions": dimensions},
+        {"MetricName": "HTTPErrors", "Value": summary.get("http_errors", 0),
+         "Unit": "Count", "Dimensions": dimensions},
+    ]
+    try:
+        cw_client.put_metric_data(Namespace=namespace, MetricData=metric_data)
+        logger.info("Published %d CloudWatch metrics to %s", len(metric_data), namespace)
+    except Exception as exc:
+        logger.error("Failed to publish CloudWatch metrics: %s", exc)
+
+
+# ===================================================================
+# Package Allowlist / Denylist Filtering
+# ===================================================================
+def _matches_glob_list(name: str, patterns: list[str]) -> bool:
+    """Check if a package name matches any glob pattern in the list."""
+    for pattern in patterns:
+        if fnmatch.fnmatch(name, pattern):
+            return True
+    return False
+
+
+def _filter_packages(
+    names: list[str], allowlist: list[str], denylist: list[str],
+) -> tuple[list[str], list[str]]:
+    """Apply allowlist then denylist filters. Returns (accepted, filtered_out)."""
+    accepted, filtered_out = [], []
+    for name in names:
+        if allowlist and not _matches_glob_list(name, allowlist):
+            filtered_out.append(name)
+            continue
+        if denylist and _matches_glob_list(name, denylist):
+            filtered_out.append(name)
+            continue
+        accepted.append(name)
+    if filtered_out:
+        logger.info("Package filter: %d accepted, %d filtered out "
+                     "(allowlist=%d patterns, denylist=%d patterns)",
+                     len(accepted), len(filtered_out), len(allowlist), len(denylist))
+    return accepted, filtered_out
+
+
+# ===================================================================
+# Retry Logic with Exponential Backoff
+# ===================================================================
+def _retry_with_backoff(fn, max_attempts=RETRY_MAX_ATTEMPTS,
+                        base_delay=RETRY_BASE_DELAY,
+                        retryable_codes=(429, 500, 502, 503, 504),
+                        label=""):
+    """Execute fn() with exponential backoff on retryable HTTP errors."""
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code not in retryable_codes or attempt == max_attempts:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning("Retry %d/%d for %s — HTTP %d — waiting %.1fs",
+                           attempt, max_attempts, label, exc.code, delay)
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if attempt == max_attempts:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning("Retry %d/%d for %s — %s — waiting %.1fs",
+                           attempt, max_attempts, label, type(exc).__name__, delay)
+            time.sleep(delay)
+    raise last_exc
 
 
 # ===================================================================
@@ -244,15 +395,10 @@ def parse_lockfile(lockfile_json: dict) -> list[dict]:
     for key, meta in packages.items():
         if not key or "node_modules/" not in key:
             continue
-        # Extract package name from the LAST node_modules/ segment.
-        # Lockfiles have nested deps like:
-        #   node_modules/@radix-ui/react-alert-dialog/node_modules/@radix-ui/primitive
-        # We want just: @radix-ui/primitive
         name = key.rsplit("node_modules/", 1)[-1]
         version = meta.get("version")
         if not name or not version or "node_modules" in name:
             continue
-        # Deduplicate — nested deps can duplicate top-level ones
         dedup_key = f"{name}@{version}"
         if dedup_key in seen:
             continue
@@ -282,14 +428,7 @@ def _cgr_auth_header() -> str:
 
 
 class _StripAuthOnRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Strip Authorization header on redirect so S3 presigned URLs work.
-
-    Chainguard's registry returns 302 redirects from tarball URLs to
-    presigned S3 URLs. Python's urllib forwards all headers on redirect.
-    S3 sees the Basic auth header, treats it as malformed SigV4, and
-    returns 400 'Missing x-amz-content-sha256'. Stripping the header
-    lets the presigned URL's query-string auth work correctly.
-    """
+    """Strip Authorization header on redirect so S3 presigned URLs work."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_req is not None:
@@ -303,20 +442,22 @@ _cgr_opener = urllib.request.build_opener(_StripAuthOnRedirectHandler)
 
 
 def fetch_chainguard_metadata(name: str, tracker: ErrorTracker) -> Optional[dict]:
-    """Fetch full package metadata from Chainguard (all versions).
-    Returns parsed JSON dict or None if not found.
-    """
+    """Fetch full package metadata from Chainguard with retry + backoff."""
     encoded_name = urllib.parse.quote(name, safe="@")
     metadata_url = f"{CGR_REGISTRY}/{encoded_name}"
     auth = _cgr_auth_header()
 
     logger.debug("Fetching registry metadata: %s", metadata_url)
-    req = urllib.request.Request(metadata_url, headers={
-        "Authorization": auth, "Accept": "application/json",
-    })
-    try:
+
+    def _do_fetch():
+        req = urllib.request.Request(metadata_url, headers={
+            "Authorization": auth, "Accept": "application/json",
+        })
         with urllib.request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read())
+
+    try:
+        return _retry_with_backoff(_do_fetch, label=f"metadata:{name}")
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 401, 403):
             logger.debug("Metadata not found for %s (%s)", name, exc.code)
@@ -333,17 +474,19 @@ def fetch_chainguard_metadata(name: str, tracker: ErrorTracker) -> Optional[dict
 
 def download_tarball(tarball_url: str, name: str, version: str,
                      tracker: ErrorTracker) -> Optional[bytes]:
-    """Download a tarball using the auth-stripping opener.
-    Returns bytes on success, None on failure.
-    """
+    """Download a tarball with retry + backoff."""
     pkg_id = f"{name}@{version}"
     auth = _cgr_auth_header()
 
     logger.debug("Downloading tarball for %s: %s", pkg_id, tarball_url)
-    tar_req = urllib.request.Request(tarball_url, headers={"Authorization": auth})
-    try:
+
+    def _do_download():
+        tar_req = urllib.request.Request(tarball_url, headers={"Authorization": auth})
         with _cgr_opener.open(tar_req, timeout=120) as resp:
             return resp.read()
+
+    try:
+        return _retry_with_backoff(_do_download, label=f"tarball:{pkg_id}")
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 401, 403):
             logger.debug("Tarball download failed for %s (%s)", pkg_id, exc.code)
@@ -359,6 +502,44 @@ def download_tarball(tarball_url: str, name: str, version: str,
 
 
 # ===================================================================
+# 3b. Parallel Tarball Downloads
+# ===================================================================
+def download_tarballs_parallel(
+    work_items: list[dict], start_index: int, end_index: int,
+    tracker: ErrorTracker, max_workers: int = PARALLEL_DOWNLOADS,
+) -> dict[int, Optional[bytes]]:
+    """Download tarballs in parallel using a thread pool.
+    Returns dict mapping item index -> tarball bytes (or None on failure).
+    """
+    results: dict[int, Optional[bytes]] = {}
+    batch = work_items[start_index:end_index]
+    if not batch:
+        return results
+
+    def _download_one(idx: int, item: dict) -> tuple[int, Optional[bytes]]:
+        data = download_tarball(item["tarball_url"], item["name"],
+                                item["version"], tracker)
+        return idx, data
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_download_one, start_index + i, item): start_index + i
+            for i, item in enumerate(batch)
+        }
+        for future in as_completed(futures):
+            try:
+                idx, data = future.result()
+                results[idx] = data
+            except Exception as exc:
+                idx = futures[future]
+                item = work_items[idx]
+                handle_http_error(exc, f"{item['name']}@{item['version']}",
+                                  "fetch_tarball", tracker)
+                results[idx] = None
+    return results
+
+
+# ===================================================================
 # 4. CodeArtifact helpers
 # ===================================================================
 def _get_codeartifact_auth_token() -> str:
@@ -367,7 +548,6 @@ def _get_codeartifact_auth_token() -> str:
 
 
 def _parse_package_identity(name: str) -> dict:
-    """Return kwargs for CodeArtifact API calls (namespace + package)."""
     if name.startswith("@") and "/" in name:
         namespace, pkg = name.lstrip("@").split("/", 1)
         return {"namespace": namespace, "package": pkg}
@@ -375,14 +555,9 @@ def _parse_package_identity(name: str) -> dict:
 
 
 def list_codeartifact_versions(name: str) -> set[str]:
-    """Return set of version strings already in CodeArtifact for this package.
-    Returns empty set if package doesn't exist yet or on error.
-    """
     kwargs = {
-        "domain": DOMAIN_NAME,
-        "repository": REPO_NAME,
-        "format": "npm",
-        **_parse_package_identity(name),
+        "domain": DOMAIN_NAME, "repository": REPO_NAME,
+        "format": "npm", **_parse_package_identity(name),
     }
     versions: set[str] = set()
     try:
@@ -399,10 +574,6 @@ def list_codeartifact_versions(name: str) -> set[str]:
 
 
 def list_codeartifact_packages() -> list[str]:
-    """Return a list of npm package names directly published to CodeArtifact.
-    Filters out packages pulled from the upstream npm connection.
-    Scoped packages are returned as '@scope/name'.
-    """
     packages: list[str] = []
     upstream_skipped = 0
     try:
@@ -411,42 +582,25 @@ def list_codeartifact_packages() -> list[str]:
             domain=DOMAIN_NAME, repository=REPO_NAME, format="npm",
         ):
             for pkg in page.get("packages", []):
-                # Skip packages from upstream — they have publish=BLOCK
-                # and were cached from the public npm connection, not
-                # published by us from Chainguard.
                 origin = pkg.get("originConfiguration", {}).get("restrictions", {})
                 if origin.get("publish") == "BLOCK":
                     upstream_skipped += 1
                     continue
-
                 pkg_name = pkg.get("package", "")
                 namespace = pkg.get("namespace", "")
-                if namespace:
-                    full_name = f"@{namespace}/{pkg_name}"
-                else:
-                    full_name = pkg_name
+                full_name = f"@{namespace}/{pkg_name}" if namespace else pkg_name
                 if full_name:
                     packages.append(full_name)
     except ClientError as exc:
         logger.error("Failed to list CodeArtifact packages: %s", exc)
-    logger.info("Found %d published npm packages in CodeArtifact "
-                "(skipped %d upstream-cached packages)",
+    logger.info("Found %d published npm packages (skipped %d upstream)",
                 len(packages), upstream_skipped)
     return packages
 
 
 def cleanup_garbage_packages() -> dict:
-    """Remove packages with 'node_modules' in their name from CodeArtifact.
-
-    These are artifacts from a previous lockfile parser bug that treated
-    nested dependency paths like:
-        node_modules/@radix-ui/react-alert-dialog/node_modules/@radix-ui/primitive
-    as the package name instead of extracting just '@radix-ui/primitive'.
-
-    Returns a summary dict with counts and package names removed.
-    """
-    garbage: list[dict] = []  # list of {"name": str, "namespace": str, "package": str}
-
+    """Remove packages with 'node_modules' in their name from CodeArtifact."""
+    garbage: list[dict] = []
     try:
         paginator = ca_client.get_paginator("list_packages")
         for page in paginator.paginate(
@@ -455,17 +609,10 @@ def cleanup_garbage_packages() -> dict:
             for pkg in page.get("packages", []):
                 pkg_name = pkg.get("package", "")
                 namespace = pkg.get("namespace", "")
-                if namespace:
-                    full_name = f"@{namespace}/{pkg_name}"
-                else:
-                    full_name = pkg_name
-
+                full_name = f"@{namespace}/{pkg_name}" if namespace else pkg_name
                 if "node_modules" in full_name:
-                    garbage.append({
-                        "full_name": full_name,
-                        "namespace": namespace,
-                        "package": pkg_name,
-                    })
+                    garbage.append({"full_name": full_name,
+                                    "namespace": namespace, "package": pkg_name})
     except ClientError as exc:
         logger.error("Failed to list packages for cleanup: %s", exc)
         return {"cleaned": 0, "failed": 0, "packages": []}
@@ -474,24 +621,13 @@ def cleanup_garbage_packages() -> dict:
         logger.info("Cleanup: no garbage packages found")
         return {"cleaned": 0, "failed": 0, "packages": []}
 
-    logger.info("Cleanup: found %d garbage packages with 'node_modules' in name",
-                len(garbage))
-
-    cleaned = 0
-    failed = 0
-    cleaned_names: list[str] = []
+    logger.info("Cleanup: found %d garbage packages", len(garbage))
+    cleaned, failed, cleaned_names = 0, 0, []
 
     for pkg in garbage:
         full_name = pkg["full_name"]
-        logger.info("  Cleaning up: %s", full_name)
-
-        # First, list all versions of this garbage package
-        list_kwargs = {
-            "domain": DOMAIN_NAME,
-            "repository": REPO_NAME,
-            "format": "npm",
-            "package": pkg["package"],
-        }
+        list_kwargs = {"domain": DOMAIN_NAME, "repository": REPO_NAME,
+                       "format": "npm", "package": pkg["package"]}
         if pkg["namespace"]:
             list_kwargs["namespace"] = pkg["namespace"]
 
@@ -503,86 +639,56 @@ def cleanup_garbage_packages() -> dict:
                     versions_to_delete.append(v["version"])
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "ResourceNotFoundException":
-                logger.warning("  Could not list versions for %s: %s", full_name, exc)
+                logger.warning("Could not list versions for %s: %s", full_name, exc)
                 failed += 1
                 continue
 
         if not versions_to_delete:
-            logger.debug("  %s has no versions — skipping", full_name)
             continue
 
-        # Delete versions in batches (API supports up to 100 at a time, but
-        # we'll do smaller batches to be safe)
         batch_size = 50
         all_deleted = True
-        for i in range(0, len(versions_to_delete), batch_size):
-            batch = versions_to_delete[i:i + batch_size]
-            delete_kwargs = {
-                "domain": DOMAIN_NAME,
-                "repository": REPO_NAME,
-                "format": "npm",
-                "package": pkg["package"],
-                "versions": batch,
-            }
+        for bi in range(0, len(versions_to_delete), batch_size):
+            batch = versions_to_delete[bi:bi + batch_size]
+            delete_kwargs = {"domain": DOMAIN_NAME, "repository": REPO_NAME,
+                             "format": "npm", "package": pkg["package"],
+                             "versions": batch}
             if pkg["namespace"]:
                 delete_kwargs["namespace"] = pkg["namespace"]
-
             try:
                 result = ca_client.delete_package_versions(**delete_kwargs)
-                successful = result.get("successfulVersions", {})
-                failed_versions = result.get("failedVersions", {})
-                if failed_versions:
-                    logger.warning("  Failed to delete %d versions of %s: %s",
-                                   len(failed_versions), full_name,
-                                   list(failed_versions.keys())[:5])
+                if result.get("failedVersions", {}):
                     all_deleted = False
-                logger.debug("  Deleted %d versions of %s",
-                             len(successful), full_name)
-            except ClientError as exc:
-                logger.warning("  Error deleting versions of %s: %s", full_name, exc)
+            except ClientError:
                 all_deleted = False
 
         if all_deleted:
             cleaned += 1
             cleaned_names.append(full_name)
-            logger.info("  Removed %s (%d versions)", full_name, len(versions_to_delete))
         else:
             failed += 1
 
-    summary = {
-        "cleaned": cleaned,
-        "failed": failed,
-        "total_garbage_found": len(garbage),
-        "packages_removed": cleaned_names,
-    }
-    logger.info("Cleanup complete: removed %d packages, %d failed", cleaned, failed)
-    return summary
+    return {"cleaned": cleaned, "failed": failed,
+            "total_garbage_found": len(garbage), "packages_removed": cleaned_names}
 
 
 def _set_origin_controls(name: str):
     kwargs = {
-        "domain": DOMAIN_NAME,
-        "repository": REPO_NAME,
-        "format": "npm",
+        "domain": DOMAIN_NAME, "repository": REPO_NAME, "format": "npm",
         "restrictions": {"publish": "ALLOW", "upstream": "BLOCK"},
         **_parse_package_identity(name),
     }
     try:
         ca_client.put_package_origin_configuration(**kwargs)
     except ClientError:
-        logger.debug("Could not set origin controls for %s (may already be set)", name)
+        logger.debug("Could not set origin controls for %s", name)
 
 
 def publish_to_codeartifact(
     name: str, version: str, tarball_bytes: bytes,
     endpoint: str, auth_token: str, tracker: ErrorTracker,
 ) -> bool:
-    """Publish a tarball to CodeArtifact using the npm registry PUT protocol.
-    Returns True on success (including 'already exists').
-
-    Note: CodeArtifact's PublishPackageVersion API does NOT support npm.
-    npm packages must be published via the npm registry PUT protocol.
-    """
+    """Publish a tarball to CodeArtifact with retry + backoff."""
     pkg_id = f"{name}@{version}"
     _set_origin_controls(name)
 
@@ -590,53 +696,38 @@ def publish_to_codeartifact(
     shasum = hashlib.sha1(tarball_bytes).hexdigest()
     integrity = "sha512-" + base64.b64encode(
         hashlib.sha512(tarball_bytes).digest()).decode()
-
-    # npm's libnpmpublish uses: `${pkg.name}-${pkg.version}.tgz`
-    # for BOTH the _attachments key AND the dist.tarball filename.
-    #   wrappy       → wrappy-1.0.2.tgz
-    #   @types/node  → @types/node-16.11.43.tgz
     tarball_name = f"{name}-{version}.tgz"
 
     payload = {
-        "_id": name,
-        "name": name,
+        "_id": name, "name": name,
         "dist-tags": {"latest": version},
-        "versions": {
-            version: {
-                "name": name,
-                "version": version,
-                "_id": f"{name}@{version}",
-                "dist": {
-                    "shasum": shasum,
-                    "integrity": integrity,
-                    "tarball": f"{endpoint.rstrip('/')}/{name}/-/{tarball_name}",
-                },
-            }
-        },
-        "_attachments": {
-            tarball_name: {
-                "content_type": "application/octet-stream",
-                "data": tarball_b64,
-                "length": len(tarball_bytes),
-            }
-        },
+        "versions": {version: {
+            "name": name, "version": version,
+            "_id": f"{name}@{version}",
+            "dist": {"shasum": shasum, "integrity": integrity,
+                     "tarball": f"{endpoint.rstrip('/')}/{name}/-/{tarball_name}"},
+        }},
+        "_attachments": {tarball_name: {
+            "content_type": "application/octet-stream",
+            "data": tarball_b64, "length": len(tarball_bytes),
+        }},
     }
 
     encoded_name = urllib.parse.quote(name, safe="@")
     put_url = f"{endpoint.rstrip('/')}/{encoded_name}"
 
-    logger.debug("Publishing %s — PUT %s — attachment_key=%s",
-                  pkg_id, put_url, tarball_name)
-
-    req = urllib.request.Request(
-        put_url, data=json.dumps(payload).encode(), method="PUT",
-        headers={"Authorization": f"Bearer {auth_token}",
-                 "Content-Type": "application/json"})
+    def _do_publish():
+        req = urllib.request.Request(
+            put_url, data=json.dumps(payload).encode(), method="PUT",
+            headers={"Authorization": f"Bearer {auth_token}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.status
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            logger.info("Published %s@%s (%s)", name, version, resp.status)
-            return True
+        status = _retry_with_backoff(_do_publish, label=f"publish:{pkg_id}")
+        logger.info("Published %s@%s (%s)", name, version, status)
+        return True
     except urllib.error.HTTPError as exc:
         body = ""
         try:
@@ -648,7 +739,6 @@ def publish_to_codeartifact(
                 or "EPUBLISHCONFLICT" in body:
             logger.info("%s@%s already exists in CodeArtifact", name, version)
             return True
-        logger.debug("Publish failed for %s — HTTP %s — %s", pkg_id, exc.code, body[:300])
         tracker.record(package=pkg_id, phase="publish", error_type="HTTPError",
                        status_code=exc.code, detail=f"{exc.reason} — {body}")
         return False
@@ -661,149 +751,65 @@ def publish_to_codeartifact(
 
 
 # ===================================================================
-# 5. Work item discovery
+# 5. Work item discovery (unchanged logic, used by build_work_items)
 # ===================================================================
-def build_work_items(
-    packages: list[dict],
-    tracker: ErrorTracker,
-) -> tuple[list[dict], int, list[str]]:
-    """Build work items for the exact versions in the lockfile.
-
-    Each work item: {"name": str, "version": str, "tarball_url": str}
-
-    For each unique package name, fetches metadata from Chainguard,
-    checks which lockfile versions exist in CodeArtifact, and returns
-    only new versions that need to be synced.
-
-    Returns: (work_items, skipped_existing_count, not_in_chainguard_names)
-    """
-    work_items: list[dict] = []
-    skipped_existing = 0
-    not_in_chainguard: list[str] = []
+def build_work_items(packages, tracker):
+    work_items, skipped_existing = [], 0
+    not_in_chainguard = []
     names = unique_package_names(packages)
-
-    # Build lockfile version map
-    lockfile_versions: dict[str, set[str]] = {}
+    lockfile_versions = {}
     for p in packages:
         lockfile_versions.setdefault(p["name"], set()).add(p["version"])
-
-    logger.info("Discovery — %d unique packages (lockfile versions only)", len(names))
-
     for name in names:
         metadata = fetch_chainguard_metadata(name, tracker)
         if metadata is None:
             not_in_chainguard.append(name)
-            logger.info("  %s — not in Chainguard", name)
             continue
-
         cgr_versions = metadata.get("versions", {})
         if not cgr_versions:
             not_in_chainguard.append(name)
-            logger.info("  %s — no versions in Chainguard metadata", name)
             continue
-
-        # Only consider versions that are both in the lockfile AND in Chainguard
         candidates = lockfile_versions.get(name, set()) & set(cgr_versions.keys())
-
-        # What already exists in CodeArtifact?
         existing = list_codeartifact_versions(name)
         new_versions = candidates - existing
-        pkg_skipped = len(candidates) - len(new_versions)
-        skipped_existing += pkg_skipped
-
-        if not new_versions:
-            logger.info("  %s — all %d version(s) already in CodeArtifact",
-                        name, len(candidates))
-            continue
-
-        logger.info("  %s — %d in lockfile, %d existing, %d new to sync",
-                     name, len(candidates), pkg_skipped, len(new_versions))
-
+        skipped_existing += len(candidates) - len(new_versions)
         for version in sorted(new_versions):
-            version_meta = cgr_versions.get(version)
-            if not version_meta:
+            vm = cgr_versions.get(version)
+            if not vm:
                 continue
-            tarball_url = version_meta.get("dist", {}).get("tarball")
-            if not tarball_url:
-                logger.debug("  %s@%s — no tarball URL, skipping", name, version)
-                continue
-            work_items.append({
-                "name": name, "version": version, "tarball_url": tarball_url,
-            })
-
-    logger.info("Discovery complete — %d work items, %d skipped (existing), "
-                "%d packages not in Chainguard",
-                len(work_items), skipped_existing, len(not_in_chainguard))
+            tarball_url = vm.get("dist", {}).get("tarball")
+            if tarball_url:
+                work_items.append({"name": name, "version": version,
+                                   "tarball_url": tarball_url})
     return work_items, skipped_existing, not_in_chainguard
 
 
-def build_update_work_items(
-    tracker: ErrorTracker,
-) -> tuple[list[dict], int, int, list[str]]:
-    """Check all existing CodeArtifact packages for new versions in Chainguard.
-
-    Scans the CodeArtifact repository for all npm packages, then for each
-    package checks Chainguard for any versions not yet in CodeArtifact.
-
-    Returns: (work_items, skipped_existing_count, total_packages, not_in_chainguard_names)
-    """
-    work_items: list[dict] = []
-    skipped_existing = 0
-    not_in_chainguard: list[str] = []
-
-    # Get all existing packages from CodeArtifact
+def build_update_work_items(tracker):
+    work_items, skipped_existing = [], 0
+    not_in_chainguard = []
     existing_packages = list_codeartifact_packages()
     if not existing_packages:
-        logger.info("No existing packages found in CodeArtifact — nothing to update")
         return work_items, 0, 0, []
-
-    logger.info("Update check — scanning %d existing packages for new Chainguard versions",
-                len(existing_packages))
-
     for name in existing_packages:
-        # Get all versions from Chainguard
         metadata = fetch_chainguard_metadata(name, tracker)
         if metadata is None:
             not_in_chainguard.append(name)
-            logger.debug("  %s — not in Chainguard", name)
             continue
-
         cgr_versions = metadata.get("versions", {})
         if not cgr_versions:
             not_in_chainguard.append(name)
-            logger.debug("  %s — no versions in Chainguard metadata", name)
             continue
-
-        # Get existing versions in CodeArtifact
         existing = list_codeartifact_versions(name)
         new_versions = set(cgr_versions.keys()) - existing
-        pkg_skipped = len(cgr_versions) - len(new_versions)
-        skipped_existing += pkg_skipped
-
-        if not new_versions:
-            logger.debug("  %s — up to date (%d versions)", name, len(existing))
-            continue
-
-        logger.info("  %s — %d new version(s) available in Chainguard "
-                     "(%d in Chainguard, %d in CodeArtifact)",
-                     name, len(new_versions), len(cgr_versions), len(existing))
-
+        skipped_existing += len(cgr_versions) - len(new_versions)
         for version in sorted(new_versions):
-            version_meta = cgr_versions.get(version)
-            if not version_meta:
+            vm = cgr_versions.get(version)
+            if not vm:
                 continue
-            tarball_url = version_meta.get("dist", {}).get("tarball")
-            if not tarball_url:
-                logger.debug("  %s@%s — no tarball URL, skipping", name, version)
-                continue
-            work_items.append({
-                "name": name, "version": version, "tarball_url": tarball_url,
-            })
-
-    logger.info("Update discovery complete — %d new versions to sync across %d packages, "
-                "%d versions already current, %d packages not in Chainguard",
-                len(work_items), len(existing_packages),
-                skipped_existing, len(not_in_chainguard))
+            tarball_url = vm.get("dist", {}).get("tarball")
+            if tarball_url:
+                work_items.append({"name": name, "version": version,
+                                   "tarball_url": tarball_url})
     return work_items, skipped_existing, len(existing_packages), not_in_chainguard
 
 
@@ -825,35 +831,27 @@ def _save_checkpoint(run_id, event, phase, work_items, counters,
                      not_found_list, tracker, invocation_number,
                      package_names=None, discovery_index=0,
                      processing_index=0) -> str:
-    """Save checkpoint for either discovery or processing phase.
-
-    phase="discovery": saves package_names + discovery_index + partial work_items
-    phase="processing": saves work_items + processing_index
-    """
     bucket = (event.get("checkpoint_s3_bucket", CHECKPOINT_S3_BUCKET)
               or event.get("errors_s3_bucket", ERRORS_S3_BUCKET))
     if not bucket:
-        raise ValueError("No S3 bucket configured for checkpoints. "
-                         "Set CHECKPOINT_S3_BUCKET or ERRORS_S3_BUCKET.")
+        raise ValueError("No S3 bucket for checkpoints.")
     key = _checkpoint_key(run_id)
     checkpoint = {
-        "run_id": run_id,
-        "invocation_number": invocation_number,
-        "phase": phase,
-        "work_items": work_items,
-        "counters": counters,
-        "not_found_list": not_found_list,
-        "errors": tracker.errors,
+        "run_id": run_id, "invocation_number": invocation_number,
+        "phase": phase, "work_items": work_items, "counters": counters,
+        "not_found_list": not_found_list, "errors": tracker.errors,
         "original_event": {
-            "s3_bucket": event.get("s3_bucket"),
-            "s3_key": event.get("s3_key"),
+            "s3_bucket": event.get("s3_bucket"), "s3_key": event.get("s3_key"),
             "setup_codeartifact": False,
             "update_existing": event.get("update_existing", False),
-            "cleanup_garbage": False,  # already ran on first invocation
+            "cleanup_garbage": False,
             "max_packages": event.get("max_packages", MAX_PACKAGES),
             "errors_s3_bucket": event.get("errors_s3_bucket", ERRORS_S3_BUCKET),
             "errors_s3_prefix": event.get("errors_s3_prefix", ERRORS_S3_PREFIX),
             "checkpoint_s3_bucket": bucket,
+            "dry_run": event.get("dry_run", False),
+            "allowlist": event.get("allowlist", []),
+            "denylist": event.get("denylist", []),
         },
     }
     if phase == "discovery":
@@ -861,39 +859,25 @@ def _save_checkpoint(run_id, event, phase, work_items, counters,
         checkpoint["discovery_index"] = discovery_index
     elif phase == "processing":
         checkpoint["next_index"] = processing_index
-
     s3_client.put_object(Bucket=bucket, Key=key,
                          Body=json.dumps(checkpoint).encode(),
                          ContentType="application/json")
-    idx = discovery_index if phase == "discovery" else processing_index
-    logger.info("Checkpoint [%s] -> s3://%s/%s (index=%d, invocation=%d)",
-                phase, bucket, key, idx, invocation_number)
     return key
 
 
-def _load_checkpoint(bucket: str, key: str) -> dict:
+def _load_checkpoint(bucket, key):
     obj = s3_client.get_object(Bucket=bucket, Key=key)
-    cp = json.loads(obj["Body"].read())
-    phase = cp.get("phase", "processing")  # backward compat
-    if phase == "discovery":
-        idx = cp.get("discovery_index", 0)
-    else:
-        idx = cp.get("next_index", 0)
-    logger.info("Loaded checkpoint s3://%s/%s (phase=%s, index=%d, invocation=%d)",
-                bucket, key, phase, idx, cp.get("invocation_number", 0))
-    return cp
+    return json.loads(obj["Body"].read())
 
 
-def _delete_checkpoint(bucket: str, run_id: str):
+def _delete_checkpoint(bucket, run_id):
     try:
         s3_client.delete_object(Bucket=bucket, Key=_checkpoint_key(run_id))
-        logger.info("Deleted checkpoint for run %s", run_id)
     except Exception as exc:
         logger.warning("Could not delete checkpoint: %s", exc)
 
 
-def _checkpoint_exists(bucket: str, run_id: str) -> bool:
-    """Check if a checkpoint already exists for this run_id."""
+def _checkpoint_exists(bucket, run_id):
     if not bucket:
         return False
     try:
@@ -904,53 +888,38 @@ def _checkpoint_exists(bucket: str, run_id: str) -> bool:
 
 
 def _try_save_failure_checkpoint(
-    run_id: str, bucket: str, original_event: dict,
-    phase: str, work_items: list[dict],
-    counters: dict, not_found_list: list[str],
-    tracker: ErrorTracker, invocation_number: int,
-    package_names: Optional[list] = None,
-    discovery_index: int = 0,
-    processing_index: int = 0,
-) -> Optional[str]:
-    """Save a checkpoint on failure so the run can be resumed.
-    Skips if no bucket is configured or a checkpoint already exists.
-    Returns the run_id if saved, None otherwise.
-    """
+    run_id, bucket, original_event, phase, work_items, counters,
+    not_found_list, tracker, invocation_number,
+    package_names=None, discovery_index=0, processing_index=0,
+):
     if not bucket:
-        logger.warning("No checkpoint bucket — cannot save failure checkpoint")
         return None
     if _checkpoint_exists(bucket, run_id):
-        logger.info("Checkpoint already exists for run %s — not overwriting", run_id)
         return run_id
     try:
-        _save_checkpoint(
-            run_id, original_event, phase, work_items,
-            counters, not_found_list, tracker, invocation_number,
-            package_names=package_names,
-            discovery_index=discovery_index,
-            processing_index=processing_index)
-        logger.info("Saved failure checkpoint for run %s (phase=%s)", run_id, phase)
+        _save_checkpoint(run_id, original_event, phase, work_items,
+                         counters, not_found_list, tracker, invocation_number,
+                         package_names=package_names,
+                         discovery_index=discovery_index,
+                         processing_index=processing_index)
         return run_id
     except Exception as exc:
         logger.error("Failed to save failure checkpoint: %s", exc)
         return None
 
 
-def _self_invoke(event: dict):
-    logger.info("Self-invoking (run_id=%s, invocation=%d)",
-                event.get("_run_id"), event.get("_invocation_number"))
+def _self_invoke(event):
     lambda_client.invoke(FunctionName=FUNCTION_NAME, InvocationType="Event",
                          Payload=json.dumps(event).encode())
 
 
-def _is_time_running_out(context) -> bool:
+def _is_time_running_out(context):
     if context is None:
         return False
     return context.get_remaining_time_in_millis() < CHECKPOINT_BUFFER_MS
 
 
-def _list_checkpoints(bucket: str) -> list[dict]:
-    """List available checkpoint files in S3 with summary metadata."""
+def _list_checkpoints(bucket):
     if not bucket:
         return []
     prefix = CHECKPOINT_S3_PREFIX.rstrip("/") + "/"
@@ -975,8 +944,8 @@ def _list_checkpoints(bucket: str) -> list[dict]:
                         "last_modified": obj["LastModified"].isoformat(),
                         "resume_with": {"resume_run_id": run_id},
                     })
-                except Exception as exc:
-                    logger.warning("Could not read checkpoint %s: %s", key, exc)
+                except Exception:
+                    pass
     except Exception as exc:
         logger.error("Failed to list checkpoints: %s", exc)
     return checkpoints
@@ -988,58 +957,51 @@ def _list_checkpoints(bucket: str) -> list[dict]:
 def lambda_handler(event, context):
     """
     Entry modes:
-
-    1. NEW SESSION — sync ALL Chainguard versions for packages in the lockfile:
-       {"s3_bucket": "...", "s3_key": "package-lock.json"}
-
-    2. UPDATE EXISTING — check all CodeArtifact packages for new Chainguard versions:
-       {"update_existing": true}
-
-    3. RESUME PREVIOUS SESSION:
-       {"resume_run_id": "20260402T034658Z-abc12345"}
-
-    4. LIST AVAILABLE CHECKPOINTS:
-       {"list_checkpoints": true}
-
-    5. CLEANUP ONLY — remove garbage packages with 'node_modules' in their name:
-       {"cleanup_only": true}
+      1. NEW SESSION:       {"s3_bucket": "...", "s3_key": "package-lock.json"}
+      2. UPDATE EXISTING:   {"update_existing": true}
+      3. RESUME:            {"resume_run_id": "20260402T034658Z-abc12345"}
+      4. LIST CHECKPOINTS:  {"list_checkpoints": true}
+      5. CLEANUP ONLY:      {"cleanup_only": true}
 
     Options:
-       "cleanup_garbage": true/false  — run cleanup before new sessions (default: true)
+      "dry_run": true              — preview mode
+      "allowlist": ["@types/*"]    — only sync matching packages
+      "denylist":  ["debug"]       — skip matching packages
+      "cleanup_garbage": true      — run cleanup before sync (default: true)
     """
-    # ------------------------------------------------------------------
-    # Mode: list checkpoints
-    # ------------------------------------------------------------------
+    dry_run = event.get("dry_run", DRY_RUN_DEFAULT)
+    if dry_run:
+        logger.info("*** DRY-RUN MODE — no packages will be published ***")
+
+    allowlist = event.get("allowlist", PACKAGE_ALLOWLIST) or []
+    denylist = event.get("denylist", PACKAGE_DENYLIST) or []
+
+    # --- list checkpoints ---
     if event.get("list_checkpoints"):
         bucket = (event.get("checkpoint_s3_bucket", CHECKPOINT_S3_BUCKET)
                   or event.get("errors_s3_bucket", ERRORS_S3_BUCKET))
-        checkpoints = _list_checkpoints(bucket)
-        return _success(
-            f"Found {len(checkpoints)} checkpoint(s)",
-            {"checkpoints": checkpoints, "status": "listing"})
+        return _success(f"Found {len(_list_checkpoints(bucket))} checkpoint(s)",
+                        {"checkpoints": _list_checkpoints(bucket), "status": "listing"})
 
-    # ------------------------------------------------------------------
-    # Mode: cleanup only
-    # ------------------------------------------------------------------
+    # --- cleanup only ---
     if event.get("cleanup_only"):
-        summary = cleanup_garbage_packages()
-        return _success("Cleanup complete", {**summary, "status": "cleanup_complete"})
+        return _success("Cleanup complete",
+                        {**cleanup_garbage_packages(), "status": "cleanup_complete"})
 
     if not CGR_USERNAME or not CGR_TOKEN:
-        return _error("CGR_USERNAME and CGR_TOKEN environment variables are required")
+        msg = "CGR_USERNAME and CGR_TOKEN environment variables are required"
+        _notify_failure(msg)
+        return _error(msg)
 
     checkpoint_bucket = (event.get("checkpoint_s3_bucket", CHECKPOINT_S3_BUCKET)
                          or event.get("errors_s3_bucket", ERRORS_S3_BUCKET))
     is_update_existing = event.get("update_existing", False)
     do_cleanup = event.get("cleanup_garbage", True)
+    max_packages = int(event.get("max_packages", MAX_PACKAGES))
 
-    # ------------------------------------------------------------------
-    # Determine entry mode
-    # ------------------------------------------------------------------
     is_auto_continuation = "_checkpoint_key" in event
     is_manual_resume = "resume_run_id" in event and not is_auto_continuation
     is_new_session = not is_auto_continuation and not is_manual_resume
-    max_packages = int(event.get("max_packages", MAX_PACKAGES))
 
     if is_auto_continuation:
         run_id = event["_run_id"]
@@ -1051,19 +1013,15 @@ def lambda_handler(event, context):
         run_id = _generate_run_id()
         invocation_number = 1
 
-    # ------------------------------------------------------------------
-    # Load state from checkpoint (auto-continuation or manual resume)
-    # ------------------------------------------------------------------
+    # --- Load checkpoint ---
     if is_auto_continuation or is_manual_resume:
-        if is_auto_continuation:
-            ckpt_key = event["_checkpoint_key"]
-        else:
-            ckpt_key = _checkpoint_key(run_id)
-
+        ckpt_key = event["_checkpoint_key"] if is_auto_continuation else _checkpoint_key(run_id)
         try:
             cp = _load_checkpoint(checkpoint_bucket, ckpt_key)
         except Exception as exc:
-            return _error(f"Could not load checkpoint for run '{run_id}': {exc}")
+            msg = f"Could not load checkpoint for run '{run_id}': {exc}"
+            _notify_failure(msg, run_id)
+            return _error(msg)
 
         phase = cp.get("phase", "processing")
         work_items = cp.get("work_items", [])
@@ -1071,6 +1029,9 @@ def lambda_handler(event, context):
         not_found_list = cp["not_found_list"]
         tracker = ErrorTracker(errors=cp.get("errors", []))
         original_event = cp["original_event"]
+        dry_run = original_event.get("dry_run", dry_run)
+        allowlist = original_event.get("allowlist", allowlist)
+        denylist = original_event.get("denylist", denylist)
 
         if phase == "discovery":
             package_names = cp.get("package_names", [])
@@ -1081,13 +1042,7 @@ def lambda_handler(event, context):
             discovery_index = 0
             processing_index = cp.get("next_index", 0)
 
-        mode_label = "auto-continuation" if is_auto_continuation else "manual resume"
-        logger.info("Resuming run %s (%s) — phase=%s, invocation #%d",
-                     run_id, mode_label, phase, invocation_number)
-
-    # ------------------------------------------------------------------
-    # New session: build package name list for discovery
-    # ------------------------------------------------------------------
+    # --- New session ---
     elif is_new_session:
         phase = "discovery"
         work_items = []
@@ -1100,183 +1055,154 @@ def lambda_handler(event, context):
 
         if event.get("setup_codeartifact", False):
             setup_codeartifact()
-
-        # Run garbage cleanup (default: enabled)
         if do_cleanup:
-            cleanup_result = cleanup_garbage_packages()
-            if cleanup_result["cleaned"] > 0:
-                logger.info("Pre-run cleanup removed %d garbage packages",
-                             cleanup_result["cleaned"])
+            cleanup_garbage_packages()
 
         if is_update_existing:
-            # Update mode: get package names from CodeArtifact
             package_names = list_codeartifact_packages()
-            logger.info("New session %s — update mode, %d existing packages to check",
-                         run_id, len(package_names))
         else:
-            # Lockfile mode: get package names from lockfile
             if "lockfile_content" in event:
                 lockfile = json.loads(event["lockfile_content"])
             elif "s3_bucket" in event and "s3_key" in event:
                 obj = s3_client.get_object(Bucket=event["s3_bucket"], Key=event["s3_key"])
                 lockfile = json.loads(obj["Body"].read())
             else:
-                return _error("Provide 'lockfile_content', 's3_bucket'+'s3_key', "
-                              "'update_existing', 'resume_run_id', or 'list_checkpoints'")
-
+                msg = ("Provide 'lockfile_content', 's3_bucket'+'s3_key', "
+                       "'update_existing', 'resume_run_id', or 'list_checkpoints'")
+                _notify_failure(msg, run_id)
+                return _error(msg)
             packages = parse_lockfile(lockfile)
             if not packages:
                 return _success("No packages found in lockfile", _empty_summary())
-
             package_names = unique_package_names(packages)
-            logger.info("New session %s — %d unique packages from lockfile",
-                         run_id, len(package_names))
 
         if not package_names:
             return _success("No packages to process", _empty_summary())
 
-        # Enforce max_packages limit
+        # Apply allowlist/denylist
+        if allowlist or denylist:
+            package_names, filtered_out = _filter_packages(package_names, allowlist, denylist)
+            counters["filtered_out"] = len(filtered_out)
+            if not package_names:
+                return _success("All packages filtered out by allowlist/denylist",
+                                {**_empty_summary(), "filtered_out": len(filtered_out)})
+
         if len(package_names) > max_packages:
-            logger.warning("Package list (%d) exceeds max_packages (%d) — truncating",
-                           len(package_names), max_packages)
             package_names = package_names[:max_packages]
 
-    # ------------------------------------------------------------------
-    # Safety cap
-    # ------------------------------------------------------------------
+    # --- Safety cap ---
     if invocation_number > MAX_INVOCATIONS:
-        logger.error("MAX_INVOCATIONS=%d reached for run %s", MAX_INVOCATIONS, run_id)
         _flush_errors(tracker, original_event)
-        return _error(
-            f"Exceeded max invocations ({MAX_INVOCATIONS}). "
-            f"Resume with: {{\"resume_run_id\": \"{run_id}\"}}")
+        msg = f"Exceeded max invocations ({MAX_INVOCATIONS}). Resume with: {{\"resume_run_id\": \"{run_id}\"}}"
+        _notify_failure(msg, run_id)
+        return _error(msg)
 
     # ==================================================================
-    # PHASE 1: DISCOVERY — checkpointable
-    # Iterate package names, fetch metadata, diff versions, build work_items
+    # PHASE 1: DISCOVERY
     # ==================================================================
     if phase == "discovery":
-        # Build lockfile version map for lockfile mode
         lockfile_versions: dict[str, set[str]] = {}
         if not is_update_existing and not (is_auto_continuation or is_manual_resume):
             for p in packages:
                 lockfile_versions.setdefault(p["name"], set()).add(p["version"])
-        elif (is_auto_continuation or is_manual_resume):
-            # In lockfile mode continuations, we don't have `packages` but
-            # we don't need lockfile_versions because update_existing mode
-            # uses all Chainguard versions. For lockfile mode continuations,
-            # we re-parse the lockfile if available.
+        elif is_auto_continuation or is_manual_resume:
             oe = original_event
-            if not oe.get("update_existing", False):
-                if oe.get("s3_bucket") and oe.get("s3_key"):
-                    try:
-                        obj = s3_client.get_object(Bucket=oe["s3_bucket"], Key=oe["s3_key"])
-                        lf = json.loads(obj["Body"].read())
-                        for p in parse_lockfile(lf):
-                            lockfile_versions.setdefault(p["name"], set()).add(p["version"])
-                    except Exception:
-                        logger.warning("Could not re-parse lockfile for version filtering")
-
-        is_update = is_update_existing or original_event.get("update_existing", False)
-
-        logger.info("Discovery phase — starting at %d/%d",
-                     discovery_index, len(package_names))
+            if not oe.get("update_existing", False) and oe.get("s3_bucket") and oe.get("s3_key"):
+                try:
+                    obj = s3_client.get_object(Bucket=oe["s3_bucket"], Key=oe["s3_key"])
+                    lf = json.loads(obj["Body"].read())
+                    for p in parse_lockfile(lf):
+                        lockfile_versions.setdefault(p["name"], set()).add(p["version"])
+                except Exception:
+                    pass
 
         try:
             for i in range(discovery_index, len(package_names)):
                 if _is_time_running_out(context):
-                    logger.warning("Low on time during discovery at %d/%d — checkpointing",
-                                   i, len(package_names))
                     _flush_errors(tracker, original_event)
                     ckpt_key = _save_checkpoint(
                         run_id, original_event, "discovery", work_items,
                         counters, not_found_list, tracker, invocation_number,
                         package_names=package_names, discovery_index=i)
-                    _self_invoke({
-                        **original_event,
-                        "_run_id": run_id,
-                        "_checkpoint_key": ckpt_key,
-                        "_invocation_number": invocation_number + 1,
-                        "checkpoint_s3_bucket": checkpoint_bucket,
-                    })
+                    _self_invoke({**original_event, "_run_id": run_id,
+                                  "_checkpoint_key": ckpt_key,
+                                  "_invocation_number": invocation_number + 1,
+                                  "checkpoint_s3_bucket": checkpoint_bucket})
                     return _success(
-                        f"Discovery checkpointed at package {i}/{len(package_names)} — "
-                        f"continuation #{invocation_number + 1} launched",
-                        {"run_id": run_id, "invocation_number": invocation_number,
-                         "phase": "discovery",
-                         "discovery_progress": f"{i}/{len(package_names)}",
-                         "work_items_so_far": len(work_items),
-                         "status": "continuing", **counters})
+                        f"Discovery checkpointed at {i}/{len(package_names)}",
+                        {"run_id": run_id, "phase": "discovery", "status": "continuing"})
 
                 name = package_names[i]
                 metadata = fetch_chainguard_metadata(name, tracker)
                 if metadata is None:
                     not_found_list.append(name)
                     continue
-
                 cgr_versions = metadata.get("versions", {})
                 if not cgr_versions:
                     not_found_list.append(name)
                     continue
 
-                # ALL versions from Chainguard (not filtered by lockfile)
                 candidates = set(cgr_versions.keys())
-
                 existing = list_codeartifact_versions(name)
                 new_versions = candidates - existing
                 counters["skipped_existing"] += len(candidates) - len(new_versions)
 
-                if not new_versions:
-                    continue
-
-                logger.info("[%d/%d] %s — %d new version(s)",
-                             i + 1, len(package_names), name, len(new_versions))
-
                 for version in sorted(new_versions):
-                    version_meta = cgr_versions.get(version)
-                    if not version_meta:
+                    vm = cgr_versions.get(version)
+                    if not vm:
                         continue
-                    tarball_url = version_meta.get("dist", {}).get("tarball")
+                    tarball_url = vm.get("dist", {}).get("tarball")
                     if tarball_url:
-                        work_items.append({
-                            "name": name, "version": version,
-                            "tarball_url": tarball_url,
-                        })
-
+                        work_items.append({"name": name, "version": version,
+                                           "tarball_url": tarball_url})
                 discovery_index = i + 1
 
         except Exception as exc:
-            logger.error("Unexpected error during discovery at %d/%d: %s",
-                          discovery_index, len(package_names), exc, exc_info=True)
             _flush_errors(tracker, original_event)
             saved = _try_save_failure_checkpoint(
                 run_id, checkpoint_bucket, original_event,
                 "discovery", work_items, counters, not_found_list,
                 tracker, invocation_number,
                 package_names=package_names, discovery_index=discovery_index)
-            msg = (f"Unexpected error during discovery at {discovery_index}/"
-                   f"{len(package_names)}: {type(exc).__name__}: {str(exc)[:200]}")
+            msg = f"Discovery error at {discovery_index}/{len(package_names)}: {type(exc).__name__}: {str(exc)[:200]}"
             if saved:
                 msg += f'. Resume with: {{"resume_run_id": "{saved}"}}'
+            _notify_failure(msg, run_id)
             return _error(msg)
 
-        logger.info("Discovery complete — %d work items from %d packages",
-                     len(work_items), len(package_names))
-
         if not work_items:
-            return _success(
-                "No new versions to sync — all up to date or not in Chainguard",
-                {**_empty_summary(), "run_id": run_id,
-                 "total_packages_checked": len(package_names),
-                 "skipped_existing": counters["skipped_existing"],
-                 "not_found_packages": not_found_list})
+            summary = {**_empty_summary(), "run_id": run_id, "dry_run": dry_run,
+                       "skipped_existing": counters["skipped_existing"],
+                       "not_found_packages": not_found_list}
+            _put_metrics(summary, dry_run)
+            _notify_completion(summary, dry_run)
+            return _success("No new versions to sync", summary)
 
-        # Transition to processing phase
         phase = "processing"
         processing_index = 0
 
     # ==================================================================
-    # PHASE 2: PROCESSING — download tarballs and publish
+    # DRY-RUN EXIT
+    # ==================================================================
+    if dry_run:
+        dry_summary = {
+            "run_id": run_id, "dry_run": True,
+            "total_work_items": len(work_items), "would_sync": len(work_items),
+            "skipped_existing": counters["skipped_existing"],
+            "not_found_packages": not_found_list,
+            "sample_work_items": [f"{w['name']}@{w['version']}" for w in work_items[:25]],
+            "remaining_items": max(0, len(work_items) - 25),
+            "http_errors": tracker.count, "status": "dry_run_complete",
+        }
+        if allowlist or denylist:
+            dry_summary.update({"allowlist": allowlist, "denylist": denylist,
+                                "filtered_out": counters.get("filtered_out", 0)})
+        _put_metrics(dry_summary, dry_run=True)
+        _notify_completion(dry_summary, dry_run=True)
+        return _success("Dry-run complete — no packages were published", dry_summary)
+
+    # ==================================================================
+    # PHASE 2: PROCESSING — parallel download + publish
     # ==================================================================
     endpoint = ca_client.get_repository_endpoint(
         domain=DOMAIN_NAME, repository=REPO_NAME, format="npm",
@@ -1286,90 +1212,83 @@ def lambda_handler(event, context):
     current_index = processing_index
     timed_out = False
 
-    logger.info("Processing phase — %d work items starting at %d",
-                 len(work_items), processing_index)
+    logger.info("Processing — %d work items from %d (parallel=%d)",
+                 len(work_items), processing_index, PARALLEL_DOWNLOADS)
 
     try:
-        for i in range(processing_index, len(work_items)):
+        i = processing_index
+        while i < len(work_items):
             if _is_time_running_out(context):
-                logger.warning("Low on time at item %d/%d — checkpointing",
-                               i, len(work_items))
                 timed_out = True
                 current_index = i
                 break
 
-            item = work_items[i]
-            name, version = item["name"], item["version"]
-            tarball_url = item["tarball_url"]
-            logger.info("[%d/%d] %s@%s", i + 1, len(work_items), name, version)
+            batch_end = min(i + PARALLEL_DOWNLOADS, len(work_items))
+            tarball_map = download_tarballs_parallel(
+                work_items, i, batch_end, tracker, max_workers=PARALLEL_DOWNLOADS)
 
-            tarball = download_tarball(tarball_url, name, version, tracker)
-            if tarball is None:
-                counters["not_found"] += 1
-                not_found_list.append(f"{name}@{version}")
-                logger.info("  Tarball download failed")
-            else:
-                counters["found"] += 1
-                if not publish_to_codeartifact(name, version, tarball,
-                                               endpoint, auth_token, tracker):
-                    counters["failed"] += 1
+            for idx in range(i, batch_end):
+                if _is_time_running_out(context):
+                    timed_out = True
+                    current_index = idx
+                    break
+                item = work_items[idx]
+                tarball = tarball_map.get(idx)
+                if tarball is None:
+                    counters["not_found"] += 1
+                    not_found_list.append(f"{item['name']}@{item['version']}")
+                else:
+                    counters["found"] += 1
+                    if not publish_to_codeartifact(item["name"], item["version"],
+                                                   tarball, endpoint, auth_token, tracker):
+                        counters["failed"] += 1
+                current_index = idx + 1
 
-            current_index = i + 1
+            if timed_out:
+                break
+            i = batch_end
 
     except Exception as exc:
-        logger.error("Unexpected error at item %d/%d: %s",
-                      current_index, len(work_items), exc, exc_info=True)
         _flush_errors(tracker, original_event)
         saved = _try_save_failure_checkpoint(
             run_id, checkpoint_bucket, original_event,
             "processing", work_items, counters, not_found_list,
             tracker, invocation_number, processing_index=current_index)
-        msg = (f"Unexpected error at item {current_index}/{len(work_items)}: "
-               f"{type(exc).__name__}: {str(exc)[:200]}")
+        msg = f"Error at item {current_index}/{len(work_items)}: {type(exc).__name__}: {str(exc)[:200]}"
         if saved:
             msg += f'. Resume with: {{"resume_run_id": "{saved}"}}'
+        _notify_failure(msg, run_id)
         return _error(msg)
 
-    # ------------------------------------------------------------------
-    # Checkpoint if timed out — auto-continue
-    # ------------------------------------------------------------------
+    # --- Checkpoint on timeout ---
     if timed_out and current_index < len(work_items):
         if not checkpoint_bucket:
             _flush_errors(tracker, original_event)
-            return _error(f"Timed out at {current_index}/{len(work_items)} "
-                          f"with no checkpoint bucket configured.")
+            msg = f"Timed out at {current_index}/{len(work_items)} with no checkpoint bucket."
+            _notify_failure(msg, run_id)
+            return _error(msg)
         _flush_errors(tracker, original_event)
         ckpt_key = _save_checkpoint(
             run_id, original_event, "processing", work_items,
             counters, not_found_list, tracker, invocation_number,
             processing_index=current_index)
-        _self_invoke({
-            **original_event,
-            "_run_id": run_id,
-            "_checkpoint_key": ckpt_key,
-            "_invocation_number": invocation_number + 1,
-            "checkpoint_s3_bucket": checkpoint_bucket,
-        })
+        _self_invoke({**original_event, "_run_id": run_id,
+                      "_checkpoint_key": ckpt_key,
+                      "_invocation_number": invocation_number + 1,
+                      "checkpoint_s3_bucket": checkpoint_bucket})
         return _success(
-            f"Checkpointed at {current_index}/{len(work_items)} — "
-            f"continuation #{invocation_number + 1} launched",
-            {"run_id": run_id, "invocation_number": invocation_number,
-             "phase": "processing",
-             "processed_so_far": current_index,
-             "total_work_items": len(work_items),
-             "status": "continuing", **counters,
-             "http_errors": tracker.count})
+            f"Checkpointed at {current_index}/{len(work_items)}",
+            {"run_id": run_id, "status": "continuing",
+             "processed_so_far": current_index, **counters})
 
-    # ------------------------------------------------------------------
-    # All done — finalize
-    # ------------------------------------------------------------------
+    # --- Finalize ---
     if (is_auto_continuation or is_manual_resume) and checkpoint_bucket:
         _delete_checkpoint(checkpoint_bucket, run_id)
 
     errors_s3_uri = _flush_errors(tracker, original_event)
 
     summary = {
-        "run_id": run_id,
+        "run_id": run_id, "dry_run": dry_run,
         "total_invocations": invocation_number,
         "total_work_items": len(work_items),
         "synced_to_codeartifact": counters["found"],
@@ -1382,18 +1301,20 @@ def lambda_handler(event, context):
         "not_found_packages": not_found_list,
         "status": "complete",
     }
+    if allowlist or denylist:
+        summary.update({"allowlist": allowlist, "denylist": denylist,
+                        "filtered_out": counters.get("filtered_out", 0)})
+
     logger.info("Sync complete — %s", json.dumps(summary, indent=2))
+    _put_metrics(summary, dry_run)
+    _notify_completion(summary, dry_run)
     return _success("Sync complete", summary)
 
 
 # ===================================================================
 # Helpers
 # ===================================================================
-def _flush_errors(tracker: ErrorTracker, event: dict) -> Optional[str]:
-    """Upload errors.txt to S3 if there are any errors.
-    Called at EVERY exit point — not just clean completion.
-    Returns the S3 URI or None.
-    """
+def _flush_errors(tracker, event):
     if tracker.count == 0:
         return None
     bucket = event.get("errors_s3_bucket", ERRORS_S3_BUCKET)
@@ -1411,10 +1332,10 @@ def _empty_summary():
     }
 
 
-def _success(message: str, summary: dict):
+def _success(message, summary):
     return {"statusCode": 200, "body": {"message": message, "summary": summary}}
 
 
-def _error(message: str):
+def _error(message):
     logger.error(message)
     return {"statusCode": 400, "body": {"error": message}}

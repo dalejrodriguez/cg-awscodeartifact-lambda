@@ -5,7 +5,7 @@ For each unique package name in the lockfile, fetches ALL versions
 available in Chainguard Libraries, diffs against CodeArtifact, and
 publishes only new versions. Use this to fully populate your
 CodeArtifact mirror. For syncing only the exact lockfile versions,
-use the companion lambda: chainguard-codeartiact-sync
+use the companion lambda: chainguard-codeartifact-sync
 
 Trigger:
 {

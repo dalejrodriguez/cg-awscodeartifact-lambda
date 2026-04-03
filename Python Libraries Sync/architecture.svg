@@ -1,0 +1,104 @@
+<svg width="100%" viewBox="0 0 680 500" xmlns="http://www.w3.org/2000/svg" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;">
+<style>
+  .box-amber { fill: #FAEEDA; stroke: #854F0B; }
+  .box-purple { fill: #EEEDFE; stroke: #534AB7; }
+  .box-teal { fill: #E1F5EE; stroke: #0F6E56; }
+  .box-coral { fill: #FAECE7; stroke: #993C1D; }
+  .box-blue { fill: #E6F1FB; stroke: #185FA5; }
+  .box-gray { fill: #F1EFE8; stroke: #5F5E5A; }
+  .title { font-size: 14px; font-weight: 500; }
+  .sub { font-size: 12px; font-weight: 400; }
+  .t-amber { fill: #633806; }
+  .t-purple { fill: #26215C; }
+  .t-teal { fill: #04342C; }
+  .t-coral { fill: #4A1B0C; }
+  .t-blue { fill: #042C53; }
+  .t-gray { fill: #2C2C2A; }
+  .ts-amber { fill: #854F0B; }
+  .ts-purple { fill: #534AB7; }
+  .ts-teal { fill: #0F6E56; }
+  .ts-coral { fill: #993C1D; }
+  .ts-blue { fill: #185FA5; }
+  .ts-gray { fill: #5F5E5A; }
+  .label { font-size: 12px; font-weight: 400; fill: #5F5E5A; }
+  .arr { stroke: #888780; stroke-width: 1.5; }
+  .dashed { stroke: #888780; stroke-width: 0.5; stroke-dasharray: 6 4; }
+  .dashed-arr { stroke: #888780; stroke-width: 0.5; stroke-dasharray: 4 3; }
+</style>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<!-- S3 trigger -->
+<rect class="box-amber" x="230" y="28" width="220" height="56" rx="8" stroke-width="0.5"/>
+<text class="title t-amber" x="340" y="48" text-anchor="middle" dominant-baseline="central">S3 bucket</text>
+<text class="sub ts-amber" x="340" y="66" text-anchor="middle" dominant-baseline="central">requirements.txt</text>
+
+<!-- Arrow: S3 → Lambda container -->
+<line x1="340" y1="84" x2="340" y2="118" class="arr" marker-end="url(#arrow)"/>
+<text class="label" x="350" y="105" text-anchor="start">trigger</text>
+
+<!-- Lambda functions container -->
+<rect x="215" y="120" width="250" height="220" rx="16" fill="none" class="dashed"/>
+<text class="title" fill="#2C2C2A" x="340" y="142" text-anchor="middle" dominant-baseline="central">Lambda functions</text>
+
+<!-- Pinned-only sync -->
+<rect class="box-purple" x="235" y="158" width="210" height="56" rx="8" stroke-width="0.5"/>
+<text class="title t-purple" x="340" y="178" text-anchor="middle" dominant-baseline="central">Pinned-only sync</text>
+<text class="sub ts-purple" x="340" y="196" text-anchor="middle" dominant-baseline="central">Exact == versions</text>
+
+<!-- All-versions sync -->
+<rect class="box-teal" x="235" y="230" width="210" height="56" rx="8" stroke-width="0.5"/>
+<text class="title t-teal" x="340" y="250" text-anchor="middle" dominant-baseline="central">All-versions sync</text>
+<text class="sub ts-teal" x="340" y="268" text-anchor="middle" dominant-baseline="central">Every Chainguard version</text>
+
+<!-- Self-invoke arrow -->
+<path d="M465 260 C490 260, 490 200, 465 200" fill="none" class="dashed-arr" marker-end="url(#arrow)"/>
+<text class="label" x="500" y="234" text-anchor="start">checkpoint</text>
+<text class="label" x="500" y="248" text-anchor="start">resume</text>
+
+<!-- Chainguard registries -->
+<rect class="box-coral" x="20" y="170" width="160" height="110" rx="12" stroke-width="0.5"/>
+<text class="title t-coral" x="100" y="192" text-anchor="middle" dominant-baseline="central">Chainguard</text>
+<text class="sub ts-coral" x="100" y="212" text-anchor="middle" dominant-baseline="central">remediated</text>
+<text class="sub ts-coral" x="100" y="228" text-anchor="middle" dominant-baseline="central">standard</text>
+<text class="sub ts-coral" x="100" y="244" text-anchor="middle" dominant-baseline="central">cu126 / cu128 / cu129</text>
+
+<!-- Arrow: Chainguard → Lambdas -->
+<line x1="180" y1="225" x2="233" y2="225" class="arr" marker-end="url(#arrow)"/>
+<text class="label" x="192" y="216" text-anchor="start">pull</text>
+
+<!-- CodeArtifact -->
+<rect class="box-blue" x="510" y="158" width="150" height="56" rx="8" stroke-width="0.5"/>
+<text class="title t-blue" x="585" y="178" text-anchor="middle" dominant-baseline="central">CodeArtifact</text>
+<text class="sub ts-blue" x="585" y="196" text-anchor="middle" dominant-baseline="central">PyPI repository</text>
+
+<!-- Arrow: Lambdas → CodeArtifact -->
+<line x1="445" y1="186" x2="508" y2="186" class="arr" marker-end="url(#arrow)"/>
+<text class="label" x="460" y="178" text-anchor="start">publish</text>
+
+<!-- Observability label -->
+<text class="label" x="340" y="358" text-anchor="middle">Observability</text>
+
+<!-- Arrows to bottom services -->
+<line x1="280" y1="340" x2="125" y2="398" class="dashed-arr" marker-end="url(#arrow)"/>
+<line x1="340" y1="340" x2="340" y2="398" class="dashed-arr" marker-end="url(#arrow)"/>
+<line x1="400" y1="340" x2="555" y2="398" class="dashed-arr" marker-end="url(#arrow)"/>
+
+<!-- S3 checkpoints/errors -->
+<rect class="box-gray" x="40" y="400" width="170" height="56" rx="8" stroke-width="0.5"/>
+<text class="title t-gray" x="125" y="420" text-anchor="middle" dominant-baseline="central">S3</text>
+<text class="sub ts-gray" x="125" y="438" text-anchor="middle" dominant-baseline="central">Checkpoints + errors</text>
+
+<!-- SNS -->
+<rect class="box-gray" x="255" y="400" width="170" height="56" rx="8" stroke-width="0.5"/>
+<text class="title t-gray" x="340" y="420" text-anchor="middle" dominant-baseline="central">SNS</text>
+<text class="sub ts-gray" x="340" y="438" text-anchor="middle" dominant-baseline="central">Completion alerts</text>
+
+<!-- CloudWatch -->
+<rect class="box-gray" x="470" y="400" width="170" height="56" rx="8" stroke-width="0.5"/>
+<text class="title t-gray" x="555" y="420" text-anchor="middle" dominant-baseline="central">CloudWatch</text>
+<text class="sub ts-gray" x="555" y="438" text-anchor="middle" dominant-baseline="central">Sync metrics</text>
+</svg>

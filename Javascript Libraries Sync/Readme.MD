@@ -24,20 +24,7 @@ Both functions share the same architecture: two-phase checkpointing, automatic c
 
 ## Architecture
 
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐     ┌──────────────┐
-│  S3 Bucket   │────▶│  Lambda Function  │────▶│  Chainguard     │────▶│ CodeArtifact │
-│ (lockfile)   │     │  (sync engine)    │     │  Libraries      │     │ (npm mirror) │
-└─────────────┘     └──────────────────┘     └─────────────────┘     └──────────────┘
-                           │     ▲
-                           │     │ self-invoke on timeout
-                           ▼     │
-                     ┌──────────────────┐
-                     │  S3 Bucket       │
-                     │  (checkpoints    │
-                     │   + errors)      │
-                     └──────────────────┘
-```
+![Architecture diagram of lambda function](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/chainguard_codeartifact_sync_architecture.svg)
 
 ### Two-Phase Checkpointing
 

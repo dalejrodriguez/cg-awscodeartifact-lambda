@@ -15,7 +15,7 @@ Both functions share the same architecture: two-phase checkpointing, automatic c
 
 # Screenshots :-) - Version specific mirroring example (Next.js):
 
-![Alt text](Javascript Libraries Sync/Nextjs-single-version.jpg)
+![Alt text](https://github.com/dalejrodriguez/cg-awscodeartifact-lambda/blob/main/Javascript%20Libraries%20Sync/Nextjs-single-version.jpg)
 
 
 

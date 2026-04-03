@@ -1,6 +1,6 @@
 # Chainguard → AWS CodeArtifact NPM Sync
 
-Automated Lambda functions that mirror NPM packages from [Chainguard Libraries](https://libraries.cgr.dev) to AWS CodeArtifact. Provides supply-chain security by pulling vetted packages from Chainguard instead of public npm.
+Automated Lambda functions that mirror NPM packages from [Chainguard Libraries](https://edu.chainguard.dev/chainguard/libraries/javascript/overview/) to AWS CodeArtifact. Provides supply-chain security by pulling vetted packages from Chainguard instead of public npm.
 
 ## Overview
 

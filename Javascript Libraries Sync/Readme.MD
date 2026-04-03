@@ -13,6 +13,14 @@ This project deploys two Lambda functions and supporting infrastructure via AWS 
 
 Both functions share the same architecture: two-phase checkpointing, automatic continuation across Lambda invocations, error tracking, and garbage cleanup.
 
+# Screenshots :-) - Version specific mirroring example (Next.js):
+
+
+
+
+
+Automated Lambda functions that mirror NPM packages from [Chainguard Libraries](https://edu.chainguard.dev/chainguard/libraries/javascript/overview/) to AWS CodeArtifact. Provides supply-chain security by pulling vetted packages from Chainguard instead of public npm.
+
 ## Architecture
 
 ```

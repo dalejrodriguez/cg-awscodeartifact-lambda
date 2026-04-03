@@ -2,7 +2,9 @@
 
 A pair of AWS Lambda functions that sync Python packages from Chainguard's secure registries into AWS CodeArtifact, giving your organization a private, vulnerability-remediated PyPI mirror.
 
-These lamdas are not officially supported by Chainguard
+This configuration does not support the Chainguard cooldown repository. 
+
+These lambdas are not officially supported by Chainguard. 
 
 ## Overview
 

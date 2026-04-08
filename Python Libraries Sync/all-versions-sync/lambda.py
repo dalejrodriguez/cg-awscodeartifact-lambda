@@ -1192,33 +1192,64 @@ def publish_to_codeartifact(
 
     last_status, last_headers, last_body = 0, {}, ""
 
+    # Retryable status codes — 429 is the CodeArtifact "concurrent modification"
+    # error that fires when multiple wheels for the same package version are
+    # published in rapid succession.  5xx codes are transient server errors.
+    _PUBLISH_RETRYABLE = {429, 500, 502, 503, 504}
+
     for upload_url in upload_urls:
         logger.debug("Publishing %s — POST %s (%d bytes)", pkg_id, upload_url, len(body))
-        try:
-            status, resp_headers, resp_body = _http_post(upload_url, body,
-                                                          request_headers)
-        except Exception as exc:
-            handle_http_error(exc, pkg_id, "publish", tracker)
-            return False
 
-        last_status, last_headers, last_body = status, resp_headers, resp_body
+        # --- Retry loop around _http_post for transient errors ---
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+            try:
+                status, resp_headers, resp_body = _http_post(
+                    upload_url, body, request_headers)
+            except Exception as exc:
+                if attempt < RETRY_MAX_ATTEMPTS:
+                    delay = RETRY_BASE_DELAY_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                    logger.warning("Publish attempt %d/%d for %s — %s — waiting %.1fs",
+                                   attempt, RETRY_MAX_ATTEMPTS, pkg_id,
+                                   type(exc).__name__, delay)
+                    time.sleep(delay)
+                    continue
+                handle_http_error(exc, pkg_id, "publish", tracker)
+                return False
 
-        if status in (200, 201, 204):
-            logger.info("Published %s (HTTP %s via %s)", pkg_id, status, upload_url)
-            return True
+            # Success
+            if status in (200, 201, 204):
+                logger.info("Published %s (HTTP %s via %s)", pkg_id, status, upload_url)
+                return True
 
-        already_exists = status == 409 or (
-            status == 400
-            and any(phrase in resp_body.lower() for phrase in (
-                "file already exists", "already been registered",
-                "already exists", "filename has already",
-            ))
-        )
-        if already_exists:
-            logger.info("%s already exists in CodeArtifact", pkg_id)
-            return True
+            # Already exists — treat as success
+            already_exists = status == 409 or (
+                status == 400
+                and any(phrase in resp_body.lower() for phrase in (
+                    "file already exists", "already been registered",
+                    "already exists", "filename has already",
+                ))
+            )
+            if already_exists:
+                logger.info("%s already exists in CodeArtifact", pkg_id)
+                return True
 
-        if status != 404:
+            # Retryable error — wait and retry
+            if status in _PUBLISH_RETRYABLE and attempt < RETRY_MAX_ATTEMPTS:
+                delay = RETRY_BASE_DELAY_S * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.warning(
+                    "Publish attempt %d/%d for %s — HTTP %d — waiting %.1fs",
+                    attempt, RETRY_MAX_ATTEMPTS, pkg_id, status, delay)
+                time.sleep(delay)
+                continue
+
+            # Non-retryable error or final attempt — fall through
+            last_status, last_headers, last_body = status, resp_headers, resp_body
+            break
+        else:
+            # All retry attempts exhausted inside the inner loop
+            last_status, last_headers, last_body = status, resp_headers, resp_body
+
+        if last_status not in (0, 404):
             break
 
         logger.debug("POST %s → HTTP 404", upload_url)
@@ -1675,6 +1706,24 @@ def _list_checkpoints(bucket: str) -> list[dict]:
 # ===========================================================================
 # 12. Parallel work item processor
 # ===========================================================================
+
+# Per-package publish locks — prevents concurrent CodeArtifact writes to the
+# same package, which causes 429 "concurrent modification" errors.  Multiple
+# wheels for sqlalchemy==2.0.49 (cp310, cp311, cp312, etc.) can download in
+# parallel but must publish one at a time to the same package.
+_publish_locks: dict[str, threading.Lock] = {}
+_publish_locks_guard = threading.Lock()
+
+
+def _get_publish_lock(name: str) -> threading.Lock:
+    """Return a per-package lock, creating it if needed.  Thread-safe."""
+    normalized = _normalize_name(name)
+    with _publish_locks_guard:
+        if normalized not in _publish_locks:
+            _publish_locks[normalized] = threading.Lock()
+        return _publish_locks[normalized]
+
+
 def _process_work_item(
     item: dict,
     endpoint: str,
@@ -1729,10 +1778,16 @@ def _process_work_item(
                        exc.response["Error"]["Code"],
                        exc.response["Error"].get("Message", ""))
 
-    success = publish_to_codeartifact(
-        name, version, filename, file_bytes,
-        endpoint, auth_token, filetype, pyversion, tracker,
-    )
+    # Serialize publishes to the same package — CodeArtifact returns 429
+    # "concurrent modification" when multiple threads write different files
+    # for the same package simultaneously (e.g. sqlalchemy cp310 + cp311).
+    # Downloads still happen in parallel; only the publish is serialized.
+    pkg_lock = _get_publish_lock(name)
+    with pkg_lock:
+        success = publish_to_codeartifact(
+            name, version, filename, file_bytes,
+            endpoint, auth_token, filetype, pyversion, tracker,
+        )
     with lock:
         counters["found"] += 1
         if not success:

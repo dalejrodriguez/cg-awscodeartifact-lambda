@@ -8,6 +8,38 @@
 
 ---
 
+## Table of Contents
+
+- [What It Does](#what-it-does)
+  - [Version Selection Logic](#version-selection-logic)
+- [Architecture](#architecture)
+- [Entry Modes](#entry-modes)
+  - [1. New Session — Sync Lockfile](#1-new-session--sync-lockfile)
+  - [2. Update Existing — Check for New Versions](#2-update-existing--check-for-new-versions)
+  - [3. Resume Previous Session](#3-resume-previous-session)
+  - [4. List Checkpoints](#4-list-checkpoints)
+  - [5. Cleanup Only](#5-cleanup-only)
+  - [6. Dry Run](#6-dry-run)
+- [Event Payload Reference](#event-payload-reference)
+  - [Allowlist / Denylist Examples](#allowlist--denylist-examples)
+- [Environment Variables](#environment-variables)
+- [Response Formats](#response-formats)
+  - [Successful Completion](#successful-completion)
+  - [Discovery Checkpoint (Mid-Run)](#discovery-checkpoint-mid-run)
+  - [Processing Checkpoint (Mid-Run)](#processing-checkpoint-mid-run)
+  - [Dry Run](#dry-run)
+- [Features](#features)
+  - [Two-Phase Checkpointing](#two-phase-checkpointing)
+  - [Parallel Tarball Downloads](#parallel-tarball-downloads)
+  - [Retry with Exponential Backoff](#retry-with-exponential-backoff)
+  - [SNS Notifications](#sns-notifications)
+  - [CloudWatch Custom Metrics](#cloudwatch-custom-metrics)
+  - [Garbage Cleanup](#garbage-cleanup)
+  - [Auth Redirect Handling](#auth-redirect-handling)
+- [IAM Permissions Required](#iam-permissions-required)
+- [Error Handling](#error-handling)
+- [Scaling Guide](#scaling-guide)
+
 ## What It Does
 
 This Lambda function reads a `package-lock.json` file, extracts the exact `name@version` pairs your project depends on, checks which of those versions exist in Chainguard Libraries, and publishes the matching tarballs to your AWS CodeArtifact NPM repository. Versions already in CodeArtifact are skipped.
